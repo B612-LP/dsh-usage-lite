@@ -441,7 +441,9 @@ window.__ModuleLoader__.load({
 				ctx.slots?.inject?.("settings.section", () => ctx.slots.register({
 					name: "settings.section",
 					id: "usage-lite",
-					order: 90,
+					// 置顶：设置页默认选中 = order 最小的分区（账号=-10、通用=0），
+					// -20 让「打开设置第一眼」就是用量统计。
+					order: -20,
 					label: "用量统计",
 				}, StatsPage));
 			} catch (error) {
