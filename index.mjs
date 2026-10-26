@@ -12,6 +12,7 @@
 // 快照持久化到 ~/.dsh/usage-lite/index.json。
 // 请求路径非阻塞：/stats 立即返回内存快照，变更检测在后台进行（stale-while-revalidate）。
 // 本文件是纯 Node ESM，无构建步骤，不依赖第三方包。
+import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -350,6 +351,280 @@ export function apply(ctx) {
     res.end(JSON.stringify(statsSnapshot()));
   }
 
+  // ── 订阅额度（手动查询，快照缓存到 quotas.json） ────────────────────────────
+  // 只覆盖订阅型 provider（deepseek 系按量计费，没有窗口额度，不查）：
+  //   * openai-codex  → GET chatgpt.com/backend-api/wham/usage
+  //     （credentials 记录 llm-pi-ai/openai-codex 的 access/accountId；必须走代理 + codex UA）
+  //   * zai-coding-cn → GET open.bigmodel.cn/api/monitor/usage/quota/limit
+  //     （credentials refs.ZAI_CODING_CN_API_KEY 的静态 key，国内直连）
+  // 凭据每次查询现读、绝不落日志；打开面板只展示上次缓存结果，点按钮才真正发请求。
+  const QUOTA_VERSION = 1;
+  const quotaFile = join(indexDir, "quotas.json");
+  let quotaSnapshot = null;
+  let quotaLoaded = false;
+  let quotaRefresh = null;
+
+  const quotaInt = (v) => Math.round(Number(v) || 0).toLocaleString("en-US");
+
+  function credentialsPath() {
+    return typeof dshHomePath === "function"
+      ? dshHomePath(".credentials.yaml")
+      : join(homedir(), ".dsh", ".credentials.yaml");
+  }
+
+  async function readCredentials() {
+    try {
+      return await readFile(credentialsPath(), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  /** refs.<name> 的值（本机 credentials 的 refs 段直接存 key 本值）。 */
+  function refValue(text, name) {
+    if (!text) return null;
+    let inRefs = false;
+    for (const line of text.split("\n")) {
+      if (/^\S/.test(line)) { inRefs = line.startsWith("refs:"); continue; }
+      if (!inRefs || /^\s*#/.test(line)) continue;
+      const m = line.match(/^ {2}([^:]+): *(.*)$/);
+      if (m !== null && m[1] === name) {
+        const v = m[2].trim().replace(/^["']|["']$/g, "");
+        return v === "" ? null : v;
+      }
+    }
+    return null;
+  }
+
+  /** records.<id> payload 下的标量字段（只支持一层 payload，够本文件用）。 */
+  function recordPayload(text, id) {
+    if (!text) return null;
+    const header = `  ${id}:`;
+    let inRecord = false;
+    let inPayload = false;
+    const out = {};
+    for (const line of text.split("\n")) {
+      if (/^\S/.test(line)) { inRecord = false; inPayload = false; continue; }
+      if (line.startsWith(header)) { inRecord = true; inPayload = false; continue; }
+      if (!inRecord) continue;
+      if (/^ {2}\S/.test(line)) { inRecord = false; continue; }
+      if (line.trimStart().startsWith("#")) continue;
+      if (/^ {4}\S/.test(line)) { inPayload = line.startsWith("    payload:"); continue; }
+      const m = inPayload === true ? line.match(/^ {6}([^:]+): *(.*)$/) : null;
+      if (m !== null) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  /** 走 curl 而不是 fetch：chatgpt.com 必须经代理，undici 默认不吃 HTTPS_PROXY。 */
+  function curlText(args, timeoutMs) {
+    return new Promise((resolve) => {
+      execFile("/usr/bin/curl", args, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
+        if (error !== void 0 && error !== null) {
+          resolve({
+            ok: false,
+            body: stdout ?? "",
+            error: error.killed === true
+              ? `请求超时（${Math.round(timeoutMs / 1000)}s）`
+              : String(stderr || (error?.message ?? error)),
+          });
+          return;
+        }
+        resolve({ ok: true, body: stdout ?? "", error: null });
+      });
+    });
+  }
+
+  /** 末行是 curl -w 追加的 HTTP 状态码。 */
+  function splitCurlStatus(body) {
+    const idx = body.lastIndexOf("\n");
+    if (idx < 0) return { status: 0, text: body };
+    const status = Number(body.slice(idx + 1).trim());
+    return { status: Number.isInteger(status) && status > 0 ? status : 0, text: body.slice(0, idx) };
+  }
+
+  function windowLabelFromSeconds(sec) {
+    if (typeof sec !== "number" || !(sec > 0)) return "窗口";
+    if (sec >= 6 * 86400 && sec <= 8 * 86400) return "周窗口（7 天）";
+    if (sec < 2 * 86400) return `${Math.round(sec / 3600)} 小时窗口`;
+    return `${Math.round(sec / 86400)} 天窗口`;
+  }
+
+  async function queryCodexQuota() {
+    const base = { plan: null, windows: [], note: null, error: null };
+    const payload = recordPayload(await readCredentials(), "llm-pi-ai/openai-codex");
+    const access = typeof payload?.access === "string" ? payload.access : null;
+    const accountId = typeof payload?.accountId === "string" ? payload.accountId : null;
+    if (!access || !accountId) {
+      return { ...base, status: "unconfigured", error: "credentials 里没有 llm-pi-ai/openai-codex 记录（去设置 → 模型里登录 ChatGPT）" };
+    }
+    const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || "http://127.0.0.1:7897";
+    const { ok, body, error } = await curlText([
+      "-s", "-m", "12", "-x", proxy,
+      "-A", "codex_cli_rs/0.163.0",
+      "-H", `Authorization: Bearer ${access}`,
+      "-H", `chatgpt-account-id: ${accountId}`,
+      "-H", "originator: pi",
+      "-w", "\n%{http_code}",
+      "https://chatgpt.com/backend-api/wham/usage",
+    ], 15000);
+    if (!ok) return { ...base, status: "error", error: `网络不通（代理 ${proxy}）：${error}` };
+    const { status, text } = splitCurlStatus(body);
+    if (status === 401 || status === 403) {
+      return {
+        ...base,
+        status: "error",
+        error: status === 401
+          ? "登录凭据已过期：设置 → 模型 → OpenAI Codex 行重新登录（或官方 Codex CLI 登录后跑 codex-sync.sh）"
+          : "被 Cloudflare/代理节点拦截（403）：跑一次 ~/.dsh/bin/ai-egress-guard.sh 换可用节点",
+      };
+    }
+    let json;
+    try { json = JSON.parse(text); } catch {
+      return { ...base, status: "error", error: `HTTP ${status}，响应不是 JSON（多半被代理/Cloudflare 拦截）` };
+    }
+    if (status !== 200 || json?.rate_limit === void 0) {
+      const detail = typeof json?.error?.message === "string" && json.error.message !== ""
+        ? json.error.message
+        : String(json?.detail ?? text.slice(0, 160));
+      return { ...base, status: "error", error: `HTTP ${status}：${detail}` };
+    }
+    const rl = json.rate_limit;
+    const windows = [];
+    for (const w of [rl.primary_window, rl.secondary_window]) {
+      if (!w || typeof w.used_percent !== "number") continue;
+      windows.push({
+        label: windowLabelFromSeconds(w.limit_window_seconds),
+        usedPercent: w.used_percent,
+        detail: null,
+        resetAfterSeconds: typeof w.reset_after_seconds === "number" ? w.reset_after_seconds : null,
+        resetAt: typeof w.reset_at === "number" ? w.reset_at * 1000 : null,
+      });
+    }
+    const notes = [];
+    if (rl.limit_reached === true) notes.push("已达窗口上限");
+    const creditsLeft = json.rate_limit_reset_credits?.available_count;
+    if (typeof creditsLeft === "number" && creditsLeft > 0) notes.push(`储存的重置 ×${creditsLeft}`);
+    return {
+      ...base,
+      status: "ok",
+      plan: typeof json.plan_type === "string" ? json.plan_type : null,
+      windows,
+      note: notes.length > 0 ? notes.join(" · ") : null,
+    };
+  }
+
+  async function queryGlmQuota() {
+    const base = { plan: null, windows: [], note: null, error: null };
+    const key = refValue(await readCredentials(), "ZAI_CODING_CN_API_KEY");
+    if (!key) return { ...base, status: "unconfigured", error: "credentials refs 里没有 ZAI_CODING_CN_API_KEY" };
+    const { ok, body, error } = await curlText([
+      "-s", "-m", "12",
+      "-H", `Authorization: Bearer ${key}`,
+      "-w", "\n%{http_code}",
+      "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+    ], 15000);
+    if (!ok) return { ...base, status: "error", error: `网络不通：${error}` };
+    const { status, text } = splitCurlStatus(body);
+    let json;
+    try { json = JSON.parse(text); } catch {
+      return { ...base, status: "error", error: `HTTP ${status}，响应不是 JSON` };
+    }
+    if (json?.success !== true) {
+      return {
+        ...base,
+        status: "error",
+        error: typeof json?.msg === "string" && json.msg !== "" ? `智谱接口：${json.msg}` : `HTTP ${status}`,
+      };
+    }
+    // 智谱 2026-07 改版后是积分制：usage=窗口积分上限，currentValue=已用，remaining=剩余；
+    // unit=3 → 5 小时窗口、unit=6 → 周窗口；旧套餐 type 为 TOKENS_LIMIT，新版为 CREDIT_LIMIT。
+    const UNIT_LABEL = { 3: "5 小时窗口", 6: "周窗口" };
+    const windows = (Array.isArray(json.data?.limits) ? json.data.limits : [])
+      .filter((l) => l?.type === "TOKENS_LIMIT" || l?.type === "CREDIT_LIMIT")
+      .sort((a, b) => (a.unit ?? 0) - (b.unit ?? 0))
+      .map((l) => ({
+        label: UNIT_LABEL[l.unit] ?? `窗口（unit=${l.unit}）`,
+        usedPercent: typeof l.percentage === "number" ? l.percentage : null,
+        detail: l.usage > 0 ? `已用 ${quotaInt(l.currentValue)} / ${quotaInt(l.usage)} · 剩 ${quotaInt(l.remaining)} 积分` : null,
+        resetAfterSeconds: null,
+        resetAt: typeof l.nextResetTime === "number" ? l.nextResetTime : null,
+      }));
+    return {
+      ...base,
+      status: "ok",
+      plan: typeof json.data?.level === "string" ? json.data.level : null,
+      windows,
+      note: null,
+    };
+  }
+
+  const QUOTA_PROVIDERS = [
+    { id: "openai-codex", label: "OpenAI Codex (ChatGPT)", query: queryCodexQuota },
+    { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", query: queryGlmQuota },
+  ];
+
+  function emptyQuotaSnapshot() {
+    return {
+      version: QUOTA_VERSION,
+      queriedAt: null,
+      providers: QUOTA_PROVIDERS.map((p) => ({ id: p.id, label: p.label, status: "pending", plan: null, windows: [], note: null, error: null })),
+    };
+  }
+
+  async function persistQuotas() {
+    try {
+      await mkdir(indexDir, { recursive: true });
+      const tmp = `${quotaFile}.tmp`;
+      await writeFile(tmp, JSON.stringify(quotaSnapshot));
+      await rename(tmp, quotaFile);
+    } catch (error) {
+      log("warn", "quota snapshot persist failed", error);
+    }
+  }
+
+  async function loadQuotas() {
+    try {
+      const raw = JSON.parse(await readFile(quotaFile, "utf8"));
+      if (raw?.version === QUOTA_VERSION) quotaSnapshot = raw;
+    } catch (error) {
+      if (error?.code !== "ENOENT") log("warn", "quota snapshot unreadable, ignoring", error);
+    }
+    quotaLoaded = true;
+  }
+
+  /** 手动刷新：并发查所有 provider（单飞行），成功后落盘。 */
+  function runQuotaRefresh() {
+    if (quotaRefresh === null) {
+      quotaRefresh = (async () => {
+        const results = await Promise.all(QUOTA_PROVIDERS.map(async (p) => {
+          try {
+            return { id: p.id, label: p.label, ...(await p.query()) };
+          } catch (error) {
+            return { id: p.id, label: p.label, status: "error", plan: null, windows: [], note: null, error: String(error?.message ?? error) };
+          }
+        }));
+        quotaSnapshot = { version: QUOTA_VERSION, queriedAt: Date.now(), providers: results };
+        await persistQuotas();
+        return quotaSnapshot;
+      })()
+        .catch((error) => {
+          log("error", "quota refresh failed", error);
+          return quotaSnapshot ?? emptyQuotaSnapshot();
+        })
+        .finally(() => { quotaRefresh = null; });
+    }
+    return quotaRefresh;
+  }
+
+  async function quotasRoute(res, force) {
+    if (quotaLoaded === false) await loadQuotas();
+    if (force === true) await runQuotaRefresh();
+    const snapshot = quotaSnapshot ?? emptyQuotaSnapshot();
+    res.writeHead(200, JSON_HEADERS);
+    res.end(JSON.stringify({ ok: true, ...snapshot }));
+  }
+
   ctx.effect(() => {
     // 装载：读快照并预热一次扫描，让首次打开页面就有数据。
     void loadIndex().then(() => refresh(Date.now()));
@@ -370,6 +645,14 @@ export function apply(ctx) {
         res.end(JSON.stringify({ ok: true, at: Date.now() }));
         return;
       }
+      if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/quotas`) {
+        return quotasRoute(res, url.searchParams.get("refresh") === "1");
+      }
+      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/quotas/refresh`) return quotasRoute(res, true);
+      if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/quotas`) {
+        return quotasRoute(res, url.searchParams.get("refresh") === "1");
+      }
+      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/quotas/refresh`) return quotasRoute(res, true);
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("not found");
     },

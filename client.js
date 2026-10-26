@@ -105,9 +105,12 @@ window.__ModuleLoader__.load({
 			},
 			rangeRow: { display: "flex", gap: 6 },
 			rangeBtn: (active) => ({
-				border: "1px solid " + (active ? "var(--dsw-alias-brand-primary, #4b7bec)" : "var(--dsw-alias-border-subtle, rgba(127,127,127,.35))"),
-				background: active ? "var(--dsw-alias-brand-primary, #4b7bec)" : "transparent",
-				color: active ? "#fff" : "inherit",
+				// 文字永远继承正文色（深浅主题都可读）；选中态用半透明底+加粗区分，
+				// 不用「品牌色底 + 白字」——暗色主题品牌变量偏浅，会白字白底隐身。
+				border: "1px solid " + (active ? "var(--dsw-alias-border-strong, rgba(127,127,127,.65))" : "var(--dsw-alias-border-subtle, rgba(127,127,127,.35))"),
+				background: active ? "var(--dsw-alias-interactive-bg-active, rgba(127,127,127,.28))" : "var(--dsw-alias-interactive-bg, rgba(127,127,127,.10))",
+				color: "inherit",
+				fontWeight: active ? 600 : 400,
 				borderRadius: 999, padding: "3px 12px", cursor: "pointer", fontSize: 12,
 			}),
 			cards: { display: "flex", gap: 10, flexWrap: "wrap" },
@@ -132,6 +135,23 @@ window.__ModuleLoader__.load({
 			tdLeft: { textAlign: "left", padding: "4px 8px", borderBottom: "1px solid var(--dsw-alias-border-subtle, rgba(127,127,127,.12))", whiteSpace: "nowrap", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" },
 			sectionTitle: { fontSize: 13, fontWeight: 600, margin: "4px 0 6px" },
 			error: { color: "#c0392b", fontSize: 12 },
+			quotaGrid: { display: "flex", gap: 10, flexWrap: "wrap" },
+			providerCard: {
+				flex: "1 1 300px", borderRadius: 10, padding: "10px 14px",
+				background: "var(--dsw-alias-bg-layer-3, rgba(127,127,127,.08))",
+				border: "1px solid var(--dsw-alias-border-subtle, rgba(127,127,127,.2))",
+			},
+			providerHead: { display: "flex", alignItems: "center", gap: 8 },
+			providerName: { fontWeight: 600, fontSize: 13 },
+			planChip: { fontSize: 11, lineHeight: "16px", padding: "0 8px", borderRadius: 999, border: "1px solid var(--dsw-alias-border-subtle, rgba(127,127,127,.35))", color: "var(--dsw-alias-label-secondary, #888)" },
+			windowRow: { marginTop: 9 },
+			windowHead: { display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12, marginBottom: 3 },
+			track: { height: 6, borderRadius: 3, background: "var(--dsw-alias-border-subtle, rgba(127,127,127,.25))", overflow: "hidden" },
+			fill: (ratio) => ({
+				width: `${Math.round(Math.min(1, Math.max(0, ratio)) * 100)}%`, height: "100%", borderRadius: 3,
+				background: ratio >= 0.9 ? "#e05252" : ratio >= 0.7 ? "#e08e2b" : "var(--dsw-alias-brand-primary, #4b7bec)",
+			}),
+			buttonDisabled: { opacity: 0.6, cursor: "default" },
 		};
 
 		// ── 组件 ─────────────────────────────────────────────────────────────
@@ -196,6 +216,89 @@ window.__ModuleLoader__.load({
 				})));
 		}
 
+		// ── 订阅额度（手动查询，展示宿主缓存的快照） ──────────────────────────
+		function humanizeReset(seconds, resetAt) {
+			let s = seconds;
+			if (s == null && resetAt != null) s = Math.round((resetAt - Date.now()) / 1000);
+			if (s == null || !(s > 0)) return null;
+			if (s >= 86400) return `${(s / 86400).toFixed(s >= 10 * 86400 ? 0 : 1)} 天后重置`;
+			if (s >= 3600) return `${(s / 3600).toFixed(s >= 10 * 3600 ? 0 : 1)} 小时后重置`;
+			return `${Math.max(1, Math.round(s / 60))} 分钟后重置`;
+		}
+
+		function QuotaWindow({ w }) {
+			const pct = typeof w.usedPercent === "number" ? Math.max(0, Math.min(100, w.usedPercent)) : null;
+			const reset = humanizeReset(w.resetAfterSeconds ?? null, w.resetAt ?? null);
+			const right = [pct === null ? null : `已用 ${pct}%`, w.detail, reset].filter(Boolean).join(" · ");
+			return e("div", { style: css.windowRow },
+				e("div", { style: css.windowHead },
+					e("span", null, w.label),
+					right === "" ? null : e("span", { style: css.muted }, right)),
+				e("div", { style: css.track }, e("div", { style: css.fill((pct ?? 0) / 100) })));
+		}
+
+		function QuotaProviderCard({ p }) {
+			return e("div", { style: css.providerCard },
+				e("div", { style: css.providerHead },
+					e("span", { style: css.providerName }, p.label ?? p.id),
+					p.plan ? e("span", { style: css.planChip }, p.plan) : null),
+				p.status === "ok"
+					? [
+						...p.windows.map((w, i) => e(QuotaWindow, { key: `${p.id}\u0000${i}`, w })),
+						p.note ? e("div", { style: { ...css.muted, marginTop: 6 } }, p.note) : null,
+						p.windows.length === 0 && !p.note ? e("div", { style: { ...css.muted, marginTop: 6 } }, "接口没有返回窗口额度。") : null,
+					]
+					: null,
+				p.status === "pending" ? e("div", { style: { ...css.muted, marginTop: 6 } }, "尚未查询。") : null,
+				p.status === "unconfigured" ? e("div", { style: { ...css.muted, marginTop: 6 } }, p.error ?? "未找到该 provider 的凭据。") : null,
+				p.status === "error" ? e("div", { style: { ...css.error, marginTop: 6 } }, p.error ?? "查询失败。") : null);
+		}
+
+		function QuotaSection() {
+			const [state, setState] = React.useState({ data: null, busy: false, error: null });
+			const load = React.useCallback(async () => {
+				try {
+					const response = await fetch(`/usage-lite/quotas?t=${Date.now()}`, { headers: { accept: "application/json" } });
+					if (!response.ok) throw new Error(`HTTP ${response.status}`);
+					const data = await response.json();
+					if (data?.ok !== true) throw new Error("unexpected payload");
+					setState((prev) => ({ ...prev, data, error: null }));
+				} catch (error) {
+					setState((prev) => ({ ...prev, error: String(error?.message ?? error) }));
+				}
+			}, []);
+			const refresh = React.useCallback(async () => {
+				setState((prev) => ({ ...prev, busy: true, error: null }));
+				try {
+					const response = await fetch("/usage-lite/quotas/refresh", { method: "POST", headers: { accept: "application/json" } });
+					if (!response.ok) throw new Error(`HTTP ${response.status}`);
+					const data = await response.json();
+					if (data?.ok !== true) throw new Error("unexpected payload");
+					setState((prev) => ({ ...prev, data, busy: false }));
+				} catch (error) {
+					setState((prev) => ({ ...prev, busy: false, error: `查询失败：${String(error?.message ?? error)}（也可稍后重试）` }));
+				}
+			}, []);
+			React.useEffect(() => { void load(); }, [load]);
+			const queriedAt = state.data?.queriedAt;
+			return e("div", null,
+				e("div", { style: css.headRow },
+					e("div", { style: { ...css.sectionTitle, margin: 0 } }, "订阅额度"),
+					e("span", { style: css.muted },
+						queriedAt == null
+							? "尚未查询 · 点右侧按钮手动查询"
+							: `查询于 ${new Date(queriedAt).toLocaleTimeString("zh-CN", { hour12: false })}`),
+					e("div", { style: { flex: 1 } }),
+					e("button", {
+						style: state.busy ? { ...css.button, ...css.buttonDisabled } : css.button,
+						disabled: state.busy === true,
+						onClick: () => { void refresh(); },
+					}, state.busy ? "查询中…（几秒）" : "查询额度")),
+				state.error === null ? null : e("div", { style: css.error }, state.error),
+				e("div", { style: css.quotaGrid },
+					(state.data?.providers ?? []).map((p) => e(QuotaProviderCard, { key: p.id, p }))));
+		}
+
 		function StatsPage() {
 			const [state, setState] = React.useState({ status: "loading", data: null, error: null, range: "all", fetchedAt: 0 });
 			const load = React.useCallback(async () => {
@@ -242,6 +345,7 @@ window.__ModuleLoader__.load({
 							+ `累计 ${formatInt(t.calls ?? 0)} 次计费调用 · 更新于 ${updated}`)),
 					e("button", { style: css.button, onClick: () => { void load(); } },
 						state.status === "refreshing" ? "刷新中…" : "刷新")),
+				e(QuotaSection, null),
 				e("div", { style: css.rangeRow },
 					RANGES.map((r) => e("button", {
 						key: r.id, style: css.rangeBtn(state.range === r.id),

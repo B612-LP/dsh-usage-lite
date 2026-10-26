@@ -66,3 +66,16 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
 ## License
 
 [MIT](./LICENSE)
+
+## Fork 定制：订阅额度面板（B612-LP）
+
+本 fork 在上游基础上增加了「订阅额度」功能（设置 → 用量统计 → 订阅额度）：
+
+- 同时查询 OpenAI Codex（`chatgpt.com/backend-api/wham/usage`，走代理 + codex UA）
+  与 智谱 GLM Coding（`open.bigmodel.cn/api/monitor/usage/quota/limit`）两类订阅的窗口额度。
+- `GET /usage-lite/quotas` 返回缓存快照（`~/.dsh/usage-lite/quotas.json`）；
+  `POST /usage-lite/quotas/refresh` 实时查询。
+- 凭据每次查询时从 DSH 凭据服务现读（refs），绝不写日志、不写代码。
+
+维护方式：上游更新后 `git fetch upstream && git merge upstream/main`，解决冲突后
+打新 tag（如 `v1.3.0-b612.1`），再把 DSH profile 依赖的 tag 钉子推进即可。
