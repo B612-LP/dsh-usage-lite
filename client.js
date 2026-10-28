@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
 			{ id: "7d", label: "近 7 天" },
 			{ id: "30d", label: "近 30 天" },
 		];
+		const QUOTA_AUTO_REFRESH_MS = 10 * 60 * 1000;
 
 		// ── 纯函数：数字与日期 ────────────────────────────────────────────────
 		function formatInt(value) {
@@ -263,8 +264,10 @@ window.__ModuleLoader__.load({
 					const data = await response.json();
 					if (data?.ok !== true) throw new Error("unexpected payload");
 					setState((prev) => ({ ...prev, data, error: null }));
+					return data;
 				} catch (error) {
 					setState((prev) => ({ ...prev, error: String(error?.message ?? error) }));
+					return null;
 				}
 			}, []);
 			const refresh = React.useCallback(async () => {
@@ -279,7 +282,14 @@ window.__ModuleLoader__.load({
 					setState((prev) => ({ ...prev, busy: false, error: `查询失败：${String(error?.message ?? error)}（也可稍后重试）` }));
 				}
 			}, []);
-			React.useEffect(() => { void load(); }, [load]);
+			React.useEffect(() => {
+				void (async () => {
+					// Auto-refresh on open unless the snapshot was queried recently.
+					const data = await load();
+					const queriedAt = data?.queriedAt;
+					if (typeof queriedAt !== "number" || Date.now() - queriedAt >= QUOTA_AUTO_REFRESH_MS) await refresh();
+				})();
+			}, [load, refresh]);
 			const queriedAt = state.data?.queriedAt;
 			return e("div", null,
 				e("div", { style: css.headRow },

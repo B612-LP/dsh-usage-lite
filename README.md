@@ -75,6 +75,7 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
   与 智谱 GLM Coding（`open.bigmodel.cn/api/monitor/usage/quota/limit`）两类订阅的窗口额度。
 - `GET /usage-lite/quotas` 返回缓存快照（`~/.dsh/usage-lite/quotas.json`）；
   `POST /usage-lite/quotas/refresh` 实时查询。
+- 打开设置页时对订阅额度自动刷新一次；快照在 10 分钟内查询过则跳过（手动查询不受限）。
 - 凭据每次查询时从 DSH 凭据服务现读（refs），绝不写日志、不写代码。
 
 维护方式：上游更新后 `git fetch upstream && git merge upstream/main`，解决冲突后
