@@ -15,7 +15,7 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 
 export const name = "dsh-usage-lite";
 
@@ -153,9 +153,76 @@ function parseIndexFile(text) {
   return entries;
 }
 
+/** records.<id> payload 下的标量字段（只支持一层 payload，够本文件用）。 */
+function recordPayload(text, id) {
+  if (!text) return null;
+  const header = `  ${id}:`;
+  let inRecord = false;
+  let inPayload = false;
+  const out = {};
+  for (const line of text.split("\n")) {
+    if (/^\S/.test(line)) { inRecord = false; inPayload = false; continue; }
+    if (line.startsWith(header)) { inRecord = true; inPayload = false; continue; }
+    if (!inRecord) continue;
+    if (/^ {2}\S/.test(line)) { inRecord = false; continue; }
+    if (line.trimStart().startsWith("#")) continue;
+    if (/^ {4}\S/.test(line)) { inPayload = line.startsWith("    payload:"); continue; }
+    const m = inPayload === true ? line.match(/^ {6}([^:]+): *(.*)$/) : null;
+    if (m !== null) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+
+/** Decode identity/expiry only; never return raw JWT data in quota responses. */
+function jwtClaims(access) {
+  try {
+    const claims = JSON.parse(Buffer.from(access.split(".")[1], "base64url").toString("utf8"));
+    return claims && typeof claims === "object" ? claims : {};
+  } catch { return {}; }
+}
+
+const identityEmail = (payload, meta = {}) => {
+  const claims = jwtClaims(payload?.access ?? "");
+  const email = claims.email || claims["https://api.openai.com/profile"]?.email || meta.email;
+  return typeof email === "string" ? email : null;
+};
+
+/** Read-only: the live payload always wins over the matching account snapshot. */
+export async function discoverCodexAccounts(dshHome) {
+  let current = null;
+  try { current = recordPayload(await readFile(join(dshHome, ".credentials.yaml"), "utf8"), "llm-pi-ai/openai-codex"); } catch {}
+  let dirs = [];
+  try { dirs = await readdir(join(dshHome, "accounts"), { withFileTypes: true }); } catch {}
+  const accounts = [];
+  const seen = new Set();
+  for (const dir of dirs.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!dir.isDirectory() || dir.name.startsWith(".") || dir.name === "_previous") continue;
+    const folder = join(dshHome, "accounts", dir.name);
+    let payload;
+    try { payload = recordPayload(await readFile(join(folder, "credential.yaml"), "utf8"), "llm-pi-ai/openai-codex"); } catch { continue; }
+    let meta = {};
+    try { meta = JSON.parse(await readFile(join(folder, "meta.json"), "utf8")) ?? {}; } catch {}
+    const accountId = payload?.accountId || (typeof meta.accountId === "string" ? meta.accountId : null);
+    if (!accountId || seen.has(accountId)) continue;
+    seen.add(accountId);
+    const active = !!current?.accountId && accountId === current.accountId;
+    payload = active ? current : { ...payload, accountId };
+    accounts.push({ id: `openai-codex:${dir.name}`, providerId: "openai-codex",
+      account: { label: dir.name, email: identityEmail(payload, meta), active }, payload });
+  }
+  if (current?.accountId && !seen.has(current.accountId)) {
+    accounts.unshift({ id: `openai-codex:${current.accountId}`, providerId: "openai-codex",
+      account: { label: "当前账号", email: identityEmail(current), active: true }, payload: current });
+  }
+  if (accounts.length === 0) accounts.push({ id: "openai-codex:current", providerId: "openai-codex",
+    account: { label: "当前账号", email: identityEmail(current), active: !!current?.accountId }, payload: current });
+  return accounts;
+}
+
 // ── 插件本体 ────────────────────────────────────────────────────────────────
 
-export function apply(ctx) {
+export function apply(ctx, { quotaExecFile = execFile } = {}) {
   const log = (level, message, error) => {
     const line = `[dsh-usage-lite] ${message}${error === void 0 ? "" : `: ${String(error?.stack ?? error)}`}`;
     try {
@@ -358,7 +425,7 @@ export function apply(ctx) {
   //   * zai-coding-cn → GET open.bigmodel.cn/api/monitor/usage/quota/limit
   //     （credentials refs.ZAI_CODING_CN_API_KEY 的静态 key，国内直连）
   // 凭据每次查询现读、绝不落日志；打开面板只展示上次缓存结果，点按钮才真正发请求。
-  const QUOTA_VERSION = 1;
+  const QUOTA_VERSION = 2;
   const quotaFile = join(indexDir, "quotas.json");
   let quotaSnapshot = null;
   let quotaLoaded = false;
@@ -396,37 +463,17 @@ export function apply(ctx) {
     return null;
   }
 
-  /** records.<id> payload 下的标量字段（只支持一层 payload，够本文件用）。 */
-  function recordPayload(text, id) {
-    if (!text) return null;
-    const header = `  ${id}:`;
-    let inRecord = false;
-    let inPayload = false;
-    const out = {};
-    for (const line of text.split("\n")) {
-      if (/^\S/.test(line)) { inRecord = false; inPayload = false; continue; }
-      if (line.startsWith(header)) { inRecord = true; inPayload = false; continue; }
-      if (!inRecord) continue;
-      if (/^ {2}\S/.test(line)) { inRecord = false; continue; }
-      if (line.trimStart().startsWith("#")) continue;
-      if (/^ {4}\S/.test(line)) { inPayload = line.startsWith("    payload:"); continue; }
-      const m = inPayload === true ? line.match(/^ {6}([^:]+): *(.*)$/) : null;
-      if (m !== null) out[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
-    }
-    return Object.keys(out).length > 0 ? out : null;
-  }
-
   /** 走 curl 而不是 fetch：chatgpt.com 必须经代理，undici 默认不吃 HTTPS_PROXY。 */
   function curlText(args, timeoutMs) {
     return new Promise((resolve) => {
-      execFile("/usr/bin/curl", args, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
+      quotaExecFile("/usr/bin/curl", args, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
         if (error !== void 0 && error !== null) {
           resolve({
             ok: false,
-            body: stdout ?? "",
+            body: "",
             error: error.killed === true
               ? `请求超时（${Math.round(timeoutMs / 1000)}s）`
-              : String(stderr || (error?.message ?? error)),
+              : "网络请求失败（curl 执行失败）",
           });
           return;
         }
@@ -450,14 +497,16 @@ export function apply(ctx) {
     return `${Math.round(sec / 86400)} 天窗口`;
   }
 
-  async function queryCodexQuota() {
+  async function queryCodexQuota(payload, account) {
     const base = { plan: null, windows: [], note: null, error: null };
-    const payload = recordPayload(await readCredentials(), "llm-pi-ai/openai-codex");
     const access = typeof payload?.access === "string" ? payload.access : null;
     const accountId = typeof payload?.accountId === "string" ? payload.accountId : null;
     if (!access || !accountId) {
       return { ...base, status: "unconfigured", error: "credentials 里没有 llm-pi-ai/openai-codex 记录（去设置 → 模型里登录 ChatGPT）" };
     }
+    const relogin = `账号「${account.label}」登录凭据已过期：请切换到此账号并重新登录后再查（额度查询不会刷新令牌）`;
+    const expiries = [Number(payload.expires), Number(jwtClaims(access).exp) * 1000];
+    if (expiries.some((expires) => expires > 0 && expires <= Date.now())) return { ...base, status: "error", error: relogin };
     const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || "http://127.0.0.1:7897";
     const { ok, body, error } = await curlText([
       "-s", "-m", "12", "-x", proxy,
@@ -468,14 +517,14 @@ export function apply(ctx) {
       "-w", "\n%{http_code}",
       "https://chatgpt.com/backend-api/wham/usage",
     ], 15000);
-    if (!ok) return { ...base, status: "error", error: `网络不通（代理 ${proxy}）：${error}` };
+    if (!ok) return { ...base, status: "error", error: `网络不通：${error}` };
     const { status, text } = splitCurlStatus(body);
     if (status === 401 || status === 403) {
       return {
         ...base,
         status: "error",
         error: status === 401
-          ? "登录凭据已过期：设置 → 模型 → OpenAI Codex 行重新登录（或官方 Codex CLI 登录后跑 codex-sync.sh）"
+          ? relogin
           : "被 Cloudflare/代理节点拦截（403）：跑一次 ~/.dsh/bin/ai-egress-guard.sh 换可用节点",
       };
     }
@@ -484,10 +533,7 @@ export function apply(ctx) {
       return { ...base, status: "error", error: `HTTP ${status}，响应不是 JSON（多半被代理/Cloudflare 拦截）` };
     }
     if (status !== 200 || json?.rate_limit === void 0) {
-      const detail = typeof json?.error?.message === "string" && json.error.message !== ""
-        ? json.error.message
-        : String(json?.detail ?? text.slice(0, 160));
-      return { ...base, status: "error", error: `HTTP ${status}：${detail}` };
+      return { ...base, status: "error", error: `HTTP ${status}：额度接口查询失败` };
     }
     const rl = json.rate_limit;
     const windows = [];
@@ -559,17 +605,30 @@ export function apply(ctx) {
     };
   }
 
-  const QUOTA_PROVIDERS = [
-    { id: "openai-codex", label: "OpenAI Codex (ChatGPT)", query: queryCodexQuota },
-    { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", query: queryGlmQuota },
-  ];
+  const dshHome = typeof dshHomePath === "function" ? dshHomePath("") : join(homedir(), ".dsh");
+  const quotaBase = () => ({ status: "pending", plan: null, windows: [], note: null, error: null });
+
+  async function quotaProviders() {
+    const accounts = await discoverCodexAccounts(dshHome);
+    return [
+      ...accounts.map(({ payload, ...identity }) => ({ ...identity, label: "OpenAI Codex (ChatGPT)",
+        query: () => queryCodexQuota(payload, identity.account) })),
+      { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", query: queryGlmQuota },
+    ];
+  }
 
   function emptyQuotaSnapshot() {
-    return {
-      version: QUOTA_VERSION,
-      queriedAt: null,
-      providers: QUOTA_PROVIDERS.map((p) => ({ id: p.id, label: p.label, status: "pending", plan: null, windows: [], note: null, error: null })),
-    };
+    return { version: QUOTA_VERSION, queriedAt: null, providers: [] };
+  }
+
+  // Discovery is local-only on every GET, including cached responses after a switch.
+  async function currentQuotaSnapshot() {
+    const snapshot = quotaSnapshot ?? emptyQuotaSnapshot();
+    const providers = await quotaProviders();
+    return { ...snapshot, providers: providers.map(({ query, ...identity }) => {
+      const cached = snapshot.providers.find((p) => p.id === identity.id);
+      return { ...quotaBase(), ...cached, ...identity };
+    }) };
   }
 
   async function persistQuotas() {
@@ -597,11 +656,12 @@ export function apply(ctx) {
   function runQuotaRefresh() {
     if (quotaRefresh === null) {
       quotaRefresh = (async () => {
-        const results = await Promise.all(QUOTA_PROVIDERS.map(async (p) => {
+        const providers = await quotaProviders();
+        const results = await Promise.all(providers.map(async ({ query, ...identity }) => {
           try {
-            return { id: p.id, label: p.label, ...(await p.query()) };
+            return { ...identity, ...(await query()) };
           } catch (error) {
-            return { id: p.id, label: p.label, status: "error", plan: null, windows: [], note: null, error: String(error?.message ?? error) };
+            return { ...identity, ...quotaBase(), status: "error", error: "额度查询失败，请稍后重试" };
           }
         }));
         quotaSnapshot = { version: QUOTA_VERSION, queriedAt: Date.now(), providers: results };
@@ -609,7 +669,7 @@ export function apply(ctx) {
         return quotaSnapshot;
       })()
         .catch((error) => {
-          log("error", "quota refresh failed", error);
+          log("error", "quota refresh failed");
           return quotaSnapshot ?? emptyQuotaSnapshot();
         })
         .finally(() => { quotaRefresh = null; });
@@ -620,7 +680,7 @@ export function apply(ctx) {
   async function quotasRoute(res, force) {
     if (quotaLoaded === false) await loadQuotas();
     if (force === true) await runQuotaRefresh();
-    const snapshot = quotaSnapshot ?? emptyQuotaSnapshot();
+    const snapshot = await currentQuotaSnapshot();
     res.writeHead(200, JSON_HEADERS);
     res.end(JSON.stringify({ ok: true, ...snapshot }));
   }

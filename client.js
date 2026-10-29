@@ -142,7 +142,7 @@ window.__ModuleLoader__.load({
 				background: "var(--dsw-alias-bg-layer-3, rgba(127,127,127,.08))",
 				border: "1px solid var(--dsw-alias-border-subtle, rgba(127,127,127,.2))",
 			},
-			providerHead: { display: "flex", alignItems: "center", gap: 8 },
+			providerHead: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
 			providerName: { fontWeight: 600, fontSize: 13 },
 			planChip: { fontSize: 11, lineHeight: "16px", padding: "0 8px", borderRadius: 999, border: "1px solid var(--dsw-alias-border-subtle, rgba(127,127,127,.35))", color: "var(--dsw-alias-label-secondary, #888)" },
 			windowRow: { marginTop: 9 },
@@ -219,8 +219,7 @@ window.__ModuleLoader__.load({
 
 		// ── 订阅额度（手动查询，展示宿主缓存的快照） ──────────────────────────
 		function humanizeReset(seconds, resetAt) {
-			let s = seconds;
-			if (s == null && resetAt != null) s = Math.round((resetAt - Date.now()) / 1000);
+			let s = resetAt != null ? Math.round((resetAt - Date.now()) / 1000) : seconds;
 			if (s == null || !(s > 0)) return null;
 			if (s >= 86400) return `${(s / 86400).toFixed(s >= 10 * 86400 ? 0 : 1)} 天后重置`;
 			if (s >= 3600) return `${(s / 3600).toFixed(s >= 10 * 3600 ? 0 : 1)} 小时后重置`;
@@ -239,10 +238,14 @@ window.__ModuleLoader__.load({
 		}
 
 		function QuotaProviderCard({ p }) {
+			const account = p.account;
 			return e("div", { style: css.providerCard },
 				e("div", { style: css.providerHead },
 					e("span", { style: css.providerName }, p.label ?? p.id),
-					p.plan ? e("span", { style: css.planChip }, p.plan) : null),
+					p.plan ? e("span", { style: css.planChip }, p.plan) : null,
+					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null),
+				account ? e("div", { style: { ...css.muted, marginTop: 3, overflowWrap: "anywhere" } },
+					[account.email, account.label].filter(Boolean).join(" · ")) : null,
 				p.status === "ok"
 					? [
 						...p.windows.map((w, i) => e(QuotaWindow, { key: `${p.id}\u0000${i}`, w })),

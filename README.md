@@ -76,7 +76,9 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
 - `GET /usage-lite/quotas` 返回缓存快照（`~/.dsh/usage-lite/quotas.json`）；
   `POST /usage-lite/quotas/refresh` 实时查询。
 - 打开设置页时对订阅额度自动刷新一次；快照在 10 分钟内查询过则跳过（手动查询不受限）。
-- 凭据每次查询时从 DSH 凭据服务现读（refs），绝不写日志、不写代码。
+- 凭据每次查询时从 DSH 凭据文件现读（refs），绝不写日志、不写代码。
+- Codex 多账号：读取 `~/.dsh/accounts/<label>/credential.yaml` 和 `meta.json`，每个账号单独展示邮箱、窗口额度与重置时间，标记「DSH 当前使用」。隐藏备份账号、按 accountId 去重；当前账号始终读取实时凭据，不用旧快照。
+- 查询不会切换账号或刷新 OAuth token；过期的非当前快照单独提示重新授权，不影响其他账号和 GLM 的查询。
 
 维护方式：上游更新后 `git fetch upstream && git merge upstream/main`，解决冲突后
 打新 tag（如 `v1.3.0-b612.1`），再把 DSH profile 依赖的 tag 钉子推进即可。
