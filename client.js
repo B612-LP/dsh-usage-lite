@@ -245,7 +245,7 @@ window.__ModuleLoader__.load({
 					p.plan ? e("span", { style: css.planChip }, p.plan) : null,
 					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null),
 				account ? e("div", { style: { ...css.muted, marginTop: 3, overflowWrap: "anywhere" } },
-					[account.email, account.label].filter(Boolean).join(" · ")) : null,
+					account.label) : null,
 				p.status === "ok"
 					? [
 						...p.windows.map((w, i) => e(QuotaWindow, { key: `${p.id}\u0000${i}`, w })),

@@ -19,7 +19,8 @@ function text(tree) {
 test('account identity and active badge render without hiding quota windows', () => {
   const p = { id: 'openai-codex:second', label: 'OpenAI Codex (ChatGPT)', account: { email: 'second@example.test', label: 'second', active: true },  plan: 'prolite', status: 'ok', windows: [] };
   const rendered = text(client.QuotaProviderCard({ p }));
-  assert.match(rendered, /second@example.test/);
+  assert.doesNotMatch(rendered, /second@example\.test/);
+  assert.match(rendered, /second/);
   assert.match(rendered, /DSH 当前使用/);
   assert.match(rendered, /prolite/);
   assert.doesNotMatch(text(client.QuotaProviderCard({ p: { ...p, account: { ...p.account, active: false } } })), /DSH 当前使用/);
