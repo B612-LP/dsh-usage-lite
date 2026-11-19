@@ -1,7 +1,7 @@
 # dsh-usage-lite · Token 用量统计插件
 
 跨**全部会话**统计 DeepSeek Harness (DSH) 的 token 总使用量，在设置面板新增「用量统计」页。
-无第三方依赖、无构建步骤、无网络调用——数据全部来自本地会话日志。
+无第三方依赖、无构建步骤。Token 统计来自本地会话日志；订阅额度查询和账号切换验证会调用对应官方服务。
 
 A zero-dependency DSH plugin that aggregates token usage across **all sessions**
 and renders it as a settings page (totals, daily trend, per-model and per-workspace breakdown).
@@ -77,8 +77,13 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
   `POST /usage-lite/quotas/refresh` 实时查询。
 - 打开设置页时对订阅额度自动刷新一次；快照在 10 分钟内查询过则跳过（手动查询不受限）。
 - 凭据每次查询时从 DSH 凭据文件现读（refs），绝不写日志、不写代码。
-- Codex 多账号：读取 `~/.dsh/accounts/<label>/credential.yaml` 和 `meta.json`，每个账号单独展示邮箱、窗口额度与重置时间，标记「DSH 当前使用」。隐藏备份账号、按 accountId 去重；当前账号始终读取实时凭据，不用旧快照。
+- Codex 多账号：读取 `~/.dsh/accounts/<label>/credential.yaml` 和 `meta.json`，每个账号展示标签、窗口额度与重置时间，标记「DSH 当前使用」，不展示邮箱。隐藏备份账号、按 accountId 去重；当前账号始终读取实时凭据，不用旧快照。
 - 查询不会切换账号或刷新 OAuth token；过期的非当前快照单独提示重新授权，不影响其他账号和 GLM 的查询。
+- 非当前 Codex 账号卡片提供「切换使用」：先弹出确认框，明确当前账号、目标账号和**全局影响所有 GPT 会话的新请求（含后续自动执行）**，取消不发送切换请求。切换期间禁用其他切换/查询按钮，不自动轮换账号，也不重启 DSH/Codex。
+- `POST /usage-lite/accounts/switch` 只接受明确确认的同源 JSON 写请求，并校验当前账号未发生变化；先验证目标凭据，必要时刷新令牌，再备份当前账号并替换唯一 Codex 凭据记录，其他 provider 不受影响。成功标记以服务器重新读取的当前身份为准；请求结果不明时只重新查询，不自动重试写操作。
+- 测试：`node --test`（临时目录和伪造凭据/网络，不会切换真实账号）。
+
+包含确认切换功能的固定版本：`github:B612-LP/dsh-usage-lite#v1.2.1-b612.5`。
 
 维护方式：上游更新后 `git fetch upstream && git merge upstream/main`，解决冲突后
 打新 tag（如 `v1.3.0-b612.1`），再把 DSH profile 依赖的 tag 钉子推进即可。

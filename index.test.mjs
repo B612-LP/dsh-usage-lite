@@ -60,7 +60,7 @@ test("discovery deduplicates IDs, skips hidden/_previous, and always substitutes
   await f.snapshot("_previous", payload("previous"));
   const accounts = await discoverCodexAccounts(f.home);
   assert.equal(accounts.length, 2);
-  assert.deepEqual(accounts[0].account, { label: "alpha", email: "live@example.test", active: true });
+  assert.deepEqual(accounts[0].account, { label: "alpha", email: "live@example.test", active: true, switchable: true });
   assert.deepEqual(accounts[0].payload, { ...live, expires: String(live.expires) });
   assert.equal(accounts[1].account.email, "metadata@example.test");
   assert.equal(accounts[1].account.active, false);

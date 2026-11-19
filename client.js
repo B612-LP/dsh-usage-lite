@@ -237,13 +237,21 @@ window.__ModuleLoader__.load({
 				e("div", { style: css.track }, e("div", { style: css.fill((pct ?? 0) / 100) })));
 		}
 
-		function QuotaProviderCard({ p }) {
+		function QuotaProviderCard({ p, onSwitch, switching = null, disabled = false }) {
 			const account = p.account;
 			return e("div", { style: css.providerCard },
 				e("div", { style: css.providerHead },
 					e("span", { style: css.providerName }, p.label ?? p.id),
 					p.plan ? e("span", { style: css.planChip }, p.plan) : null,
-					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null),
+					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null,
+					p.providerId === "openai-codex" && account?.switchable === true && account.active !== true
+						? e("button", {
+							type: "button",
+							style: { ...css.button, marginLeft: "auto", ...(disabled ? css.buttonDisabled : {}) },
+							disabled,
+							"aria-label": `切换使用 ${account.label}`,
+							onClick: () => { void onSwitch?.(p); },
+						}, switching === p.id ? "切换中…" : "切换使用") : null),
 				account ? e("div", { style: { ...css.muted, marginTop: 3, overflowWrap: "anywhere" } },
 					account.label) : null,
 				p.status === "ok"
@@ -259,32 +267,66 @@ window.__ModuleLoader__.load({
 		}
 
 		function QuotaSection() {
-			const [state, setState] = React.useState({ data: null, busy: false, error: null });
+			const [state, setState] = React.useState({ data: null, busy: false, error: null, switching: null, notice: null });
+			const switchLock = React.useRef(false);
+			const requestVersion = React.useRef(0);
 			const load = React.useCallback(async () => {
+				const version = ++requestVersion.current;
 				try {
 					const response = await fetch(`/usage-lite/quotas?t=${Date.now()}`, { headers: { accept: "application/json" } });
 					if (!response.ok) throw new Error(`HTTP ${response.status}`);
 					const data = await response.json();
 					if (data?.ok !== true) throw new Error("unexpected payload");
-					setState((prev) => ({ ...prev, data, error: null }));
+					if (version === requestVersion.current) setState((prev) => ({ ...prev, data, error: null }));
 					return data;
 				} catch (error) {
-					setState((prev) => ({ ...prev, error: String(error?.message ?? error) }));
+					if (version === requestVersion.current) setState((prev) => ({ ...prev, error: String(error?.message ?? error) }));
 					return null;
 				}
 			}, []);
 			const refresh = React.useCallback(async () => {
+				if (switchLock.current) return;
+				const version = ++requestVersion.current;
 				setState((prev) => ({ ...prev, busy: true, error: null }));
 				try {
 					const response = await fetch("/usage-lite/quotas/refresh", { method: "POST", headers: { accept: "application/json" } });
 					if (!response.ok) throw new Error(`HTTP ${response.status}`);
 					const data = await response.json();
 					if (data?.ok !== true) throw new Error("unexpected payload");
-					setState((prev) => ({ ...prev, data, busy: false }));
+					if (version === requestVersion.current) setState((prev) => ({ ...prev, data, busy: false }));
 				} catch (error) {
-					setState((prev) => ({ ...prev, busy: false, error: `查询失败：${String(error?.message ?? error)}（也可稍后重试）` }));
+					if (version === requestVersion.current) setState((prev) => ({ ...prev, busy: false, error: `查询失败：${String(error?.message ?? error)}（也可稍后重试）` }));
 				}
 			}, []);
+			const switchAccount = async (target) => {
+				if (switchLock.current || state.busy || target.providerId !== "openai-codex"
+					|| target.account?.switchable !== true || target.account.active === true) return;
+				const active = state.data?.providers.find((p) => p.providerId === "openai-codex" && p.account?.active);
+				switchLock.current = true;
+				try {
+					// Only this explicit confirmation can dispatch the write request.
+					if (!window.confirm(`确认全局切换 GPT 订阅？\n\n从：${active?.account.label ?? "未连接"}\n切换到：${target.account.label}\n\n此后所有 GPT 会话的新模型请求（含后续自动执行）都会使用这个账号，不只是当前对话。不会清空对话或重启 DSH；已发出的请求不主动中断。`)) return;
+					++requestVersion.current;
+					setState((prev) => ({ ...prev, switching: target.id, error: null, notice: null }));
+					const response = await fetch("/usage-lite/accounts/switch", {
+						method: "POST",
+						headers: { accept: "application/json", "content-type": "application/json", "x-usage-lite-action": "switch-account" },
+						body: JSON.stringify({ id: target.id, expectedActiveId: active?.id ?? null, confirmed: true }),
+					});
+					const data = await response.json();
+					if (Array.isArray(data.providers)) setState((prev) => ({ ...prev, data }));
+					if (!response.ok || data.ok !== true) throw new Error(data.error || `切换失败（HTTP ${response.status}）`);
+					if (!data.providers?.some((p) => p.id === target.id && p.account?.active === true)) throw new Error("切换结果未确认");
+					setState((prev) => ({ ...prev, notice: `已全局切换到 ${target.account.label}，之后所有 GPT 新请求使用此账号。` }));
+				} catch (error) {
+					// Reconcile only; never automatically repeat a write with an unknown outcome.
+					await load();
+					setState((prev) => ({ ...prev, error: `${String(error?.message ?? error)}。请核对「DSH 当前使用」标记；未自动重试切换。` }));
+				} finally {
+					switchLock.current = false;
+					setState((prev) => ({ ...prev, switching: null }));
+				}
+			};
 			React.useEffect(() => {
 				void (async () => {
 					// Auto-refresh on open unless the snapshot was queried recently.
@@ -303,13 +345,18 @@ window.__ModuleLoader__.load({
 							: `查询于 ${new Date(queriedAt).toLocaleTimeString("zh-CN", { hour12: false })}`),
 					e("div", { style: { flex: 1 } }),
 					e("button", {
-						style: state.busy ? { ...css.button, ...css.buttonDisabled } : css.button,
-						disabled: state.busy === true,
+						style: state.busy || state.switching ? { ...css.button, ...css.buttonDisabled } : css.button,
+						disabled: state.busy === true || state.switching !== null,
 						onClick: () => { void refresh(); },
 					}, state.busy ? "查询中…（几秒）" : "查询额度")),
-				state.error === null ? null : e("div", { style: css.error }, state.error),
+				state.error === null ? null : e("div", { role: "alert", style: css.error }, state.error),
+				state.notice === null ? null : e("div", { role: "status", style: css.muted }, state.notice),
+				e("div", { style: { ...css.muted, margin: "4px 0 8px" } }, "切换为全局生效，影响所有 GPT 会话的新请求；点击后需再次确认。"),
 				e("div", { style: css.quotaGrid },
-					(state.data?.providers ?? []).map((p) => e(QuotaProviderCard, { key: p.id, p }))));
+					(state.data?.providers ?? []).map((p) => e(QuotaProviderCard, {
+						key: p.id, p, onSwitch: switchAccount, switching: state.switching,
+						disabled: state.busy || state.switching !== null,
+					}))));
 		}
 
 		function StatsPage() {

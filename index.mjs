@@ -15,7 +15,8 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { AccountSwitchError, createTokenRefresher, switchCodexAccount } from "./account-switch.mjs";
 
 export const name = "dsh-usage-lite";
 
@@ -162,7 +163,7 @@ function recordPayload(text, id) {
   const out = {};
   for (const line of text.split("\n")) {
     if (/^\S/.test(line)) { inRecord = false; inPayload = false; continue; }
-    if (line.startsWith(header)) { inRecord = true; inPayload = false; continue; }
+    if (line === header) { inRecord = true; inPayload = false; continue; }
     if (!inRecord) continue;
     if (/^ {2}\S/.test(line)) { inRecord = false; continue; }
     if (line.trimStart().startsWith("#")) continue;
@@ -193,14 +194,24 @@ export async function discoverCodexAccounts(dshHome) {
   let current = null;
   try { current = recordPayload(await readFile(join(dshHome, ".credentials.yaml"), "utf8"), "llm-pi-ai/openai-codex"); } catch {}
   let dirs = [];
-  try { dirs = await readdir(join(dshHome, "accounts"), { withFileTypes: true }); } catch {}
+  try {
+    const root = join(dshHome, "accounts");
+    const info = await lstat(root);
+    if (info.isDirectory() && !info.isSymbolicLink()) dirs = await readdir(root, { withFileTypes: true });
+  } catch {}
   const accounts = [];
   const seen = new Set();
   for (const dir of dirs.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!dir.isDirectory() || dir.name.startsWith(".") || dir.name === "_previous") continue;
     const folder = join(dshHome, "accounts", dir.name);
     let payload;
-    try { payload = recordPayload(await readFile(join(folder, "credential.yaml"), "utf8"), "llm-pi-ai/openai-codex"); } catch { continue; }
+    let regularSnapshot = false;
+    try {
+      const info = await lstat(join(folder, "credential.yaml"));
+      regularSnapshot = info.isFile() && !info.isSymbolicLink();
+      if (!regularSnapshot) continue;
+      payload = recordPayload(await readFile(join(folder, "credential.yaml"), "utf8"), "llm-pi-ai/openai-codex");
+    } catch { continue; }
     let meta = {};
     try { meta = JSON.parse(await readFile(join(folder, "meta.json"), "utf8")) ?? {}; } catch {}
     const accountId = payload?.accountId || (typeof meta.accountId === "string" ? meta.accountId : null);
@@ -209,14 +220,15 @@ export async function discoverCodexAccounts(dshHome) {
     const active = !!current?.accountId && accountId === current.accountId;
     payload = active ? current : { ...payload, accountId };
     accounts.push({ id: `openai-codex:${dir.name}`, providerId: "openai-codex",
-      account: { label: dir.name, email: identityEmail(payload, meta), active }, payload });
+      account: { label: dir.name, email: identityEmail(payload, meta), active,
+        switchable: regularSnapshot && !!payload?.accountId && !!(payload.access || payload.refresh) }, payload });
   }
   if (current?.accountId && !seen.has(current.accountId)) {
     accounts.unshift({ id: `openai-codex:${current.accountId}`, providerId: "openai-codex",
-      account: { label: "当前账号", email: identityEmail(current), active: true }, payload: current });
+      account: { label: "当前账号", email: identityEmail(current), active: true, switchable: false }, payload: current });
   }
   if (accounts.length === 0) accounts.push({ id: "openai-codex:current", providerId: "openai-codex",
-    account: { label: "当前账号", email: identityEmail(current), active: !!current?.accountId }, payload: current });
+    account: { label: "当前账号", email: identityEmail(current), active: !!current?.accountId, switchable: false }, payload: current });
   return accounts;
 }
 
@@ -497,7 +509,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     return `${Math.round(sec / 86400)} 天窗口`;
   }
 
-  async function queryCodexQuota(payload, account) {
+  async function queryCodexQuota(payload, account, forSwitch = false) {
     const base = { plan: null, windows: [], note: null, error: null };
     const access = typeof payload?.access === "string" ? payload.access : null;
     const accountId = typeof payload?.accountId === "string" ? payload.accountId : null;
@@ -523,6 +535,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
       return {
         ...base,
         status: "error",
+        ...(forSwitch && status === 401 ? { unauthorized: true } : {}),
         error: status === 401
           ? relogin
           : "被 Cloudflare/代理节点拦截（403）：跑一次 ~/.dsh/bin/ai-egress-guard.sh 换可用节点",
@@ -532,7 +545,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     try { json = JSON.parse(text); } catch {
       return { ...base, status: "error", error: `HTTP ${status}，响应不是 JSON（多半被代理/Cloudflare 拦截）` };
     }
-    if (status !== 200 || json?.rate_limit === void 0) {
+    if (status !== 200 || !json?.rate_limit || typeof json.rate_limit !== "object" || Array.isArray(json.rate_limit)) {
       return { ...base, status: "error", error: `HTTP ${status}：额度接口查询失败` };
     }
     const rl = json.rate_limit;
@@ -685,6 +698,94 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     res.end(JSON.stringify({ ok: true, ...snapshot }));
   }
 
+  let switchingAccount = false;
+
+  function switchRequestHeaders(req) {
+    const headers = req.headers ?? {};
+    if (headers["x-usage-lite-action"] !== "switch-account") throw new AccountSwitchError("缺少账号切换确认请求头", 403);
+    if (typeof headers["content-type"] !== "string" || !/^application\/json(?:\s*;|\s*$)/i.test(headers["content-type"])) throw new AccountSwitchError("请求必须使用 application/json", 415);
+    if (headers.origin !== undefined) {
+      try {
+        const origin = new URL(headers.origin);
+        const expected = new URL(`${req.socket?.encrypted ? "https" : "http"}://${headers.host}`);
+        if (typeof headers.origin !== "string" || headers.origin !== origin.origin || origin.origin !== expected.origin || !headers.host || !["http:", "https:"].includes(origin.protocol)) throw new Error();
+      } catch { throw new AccountSwitchError("拒绝跨来源账号切换请求", 403); }
+    }
+  }
+
+  function switchRequestBody(req) {
+    return new Promise((resolve, reject) => {
+      let bytes = 0;
+      let done = false;
+      const chunks = [];
+      const finish = (error, body) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        req.removeListener("data", data);
+        req.removeListener("end", end);
+        req.removeListener("error", aborted);
+        req.removeListener("aborted", aborted);
+        if (error) { req.resume?.(); reject(error); } else resolve(body);
+      };
+      const data = (chunk) => {
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > 4096) return finish(new AccountSwitchError("请求体过大", 413));
+        chunks.push(Buffer.from(chunk));
+      };
+      const aborted = () => finish(new AccountSwitchError("请求体读取失败", 400));
+      const end = () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 3 || !Object.keys(body).every((key) => ["id", "expectedActiveId", "confirmed"].includes(key)) || body.confirmed !== true || typeof body.id !== "string" || body.id.length > 512 || !(body.expectedActiveId === null || (typeof body.expectedActiveId === "string" && body.expectedActiveId.length <= 512))) throw new Error();
+          finish(null, body);
+        } catch { finish(new AccountSwitchError("无效的账号切换参数，请重新确认", 400)); }
+      };
+      const timer = setTimeout(() => finish(new AccountSwitchError("请求体读取超时", 408)), 5000);
+      req.on("data", data);
+      req.on("end", end);
+      req.on("error", aborted);
+      req.on("aborted", aborted);
+    });
+  }
+
+  async function accountSwitchRoute(req, res) {
+    const respond = async (status, result, expectedId = null) => {
+      if (quotaLoaded === false) await loadQuotas();
+      const snapshot = await currentQuotaSnapshot();
+      if (expectedId !== null && snapshot.providers.find((provider) => provider.account?.active)?.id !== expectedId) {
+        status = 409;
+        result = { ok: false, error: "切换后当前账号再次发生变化，请刷新核对" };
+      }
+      res.writeHead(status, JSON_HEADERS);
+      res.end(JSON.stringify({ ...snapshot, ...result }));
+    };
+    try { switchRequestHeaders(req); } catch (error) { return respond(error.status, { ok: false, error: error.message }); }
+    if (switchingAccount) return respond(409, { ok: false, error: "已有账号切换正在进行，请稍候" });
+    switchingAccount = true;
+    try {
+      const body = await switchRequestBody(req);
+      if (quotaLoaded === false) await loadQuotas();
+      const result = await switchCodexAccount({
+        dshHome, ...body, discover: discoverCodexAccounts,
+        queryQuota: (payload, account) => queryCodexQuota(payload, account, true),
+        refreshTokens: createTokenRefresher(quotaExecFile),
+      });
+      // Installing credentials is the transaction. Cache maintenance is only
+      // best-effort and must not turn an already completed switch into failure.
+      try {
+        const snapshot = await currentQuotaSnapshot();
+        quotaSnapshot = { ...snapshot, queriedAt: Date.now(), providers: snapshot.providers.map((provider) => provider.id === result.id ? { ...provider, ...result.quota } : provider) };
+        await persistQuotas();
+      } catch { log("warn", "quota cache update after account switch failed"); }
+      return await respond(200, { ok: true, message: result.message }, result.id);
+    } catch (error) {
+      return await respond(error instanceof AccountSwitchError ? error.status : 500, {
+        ok: false, error: error instanceof AccountSwitchError ? error.message : "账号切换失败，请稍后重试",
+      });
+    } finally { switchingAccount = false; }
+  }
+
   ctx.effect(() => {
     // 装载：读快照并预热一次扫描，让首次打开页面就有数据。
     void loadIndex().then(() => refresh(Date.now()));
@@ -709,10 +810,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
         return quotasRoute(res, url.searchParams.get("refresh") === "1");
       }
       if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/quotas/refresh`) return quotasRoute(res, true);
-      if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/quotas`) {
-        return quotasRoute(res, url.searchParams.get("refresh") === "1");
-      }
-      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/quotas/refresh`) return quotasRoute(res, true);
+      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/accounts/switch`) return accountSwitchRoute(req, res);
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("not found");
     },
