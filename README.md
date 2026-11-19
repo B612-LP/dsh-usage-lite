@@ -1,7 +1,7 @@
 # dsh-usage-lite · Token 用量统计插件
 
 跨**全部会话**统计 DeepSeek Harness (DSH) 的 token 总使用量，在设置面板新增「用量统计」页。
-无第三方依赖、无构建步骤、无网络调用——数据全部来自本地会话日志。
+无第三方依赖、无构建步骤。Token 统计来自本地会话日志；订阅额度查询和账号切换验证会调用对应官方服务。
 
 A zero-dependency DSH plugin that aggregates token usage across **all sessions**
 and renders it as a settings page (totals, daily trend, per-model and per-workspace breakdown).
@@ -73,12 +73,15 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
 
 - 同时查询 OpenAI Codex（`chatgpt.com/backend-api/wham/usage`，走代理 + codex UA）
   与 智谱 GLM Coding（`open.bigmodel.cn/api/monitor/usage/quota/limit`）两类订阅的窗口额度。
-- `GET /usage-lite/quotas` 返回缓存快照（`~/.dsh/usage-lite/quotas.json`）；
-  `POST /usage-lite/quotas/refresh` 实时查询。
-- 打开设置页时对订阅额度自动刷新一次；快照在 10 分钟内查询过则跳过（手动查询不受限）。
-- 凭据每次查询时从 DSH 凭据文件现读（refs），绝不写日志、不写代码。
-- Codex 多账号：读取 `~/.dsh/accounts/<label>/credential.yaml` 和 `meta.json`，每个账号单独展示邮箱、窗口额度与重置时间，标记「DSH 当前使用」。隐藏备份账号、按 accountId 去重；当前账号始终读取实时凭据，不用旧快照。
-- 查询不会切换账号或刷新 OAuth token；过期的非当前快照单独提示重新授权，不影响其他账号和 GLM 的查询。
+- `GET /usage-lite/quotas` 返回缓存和当前账号；缓存超过 10 分钟时，打开页面自动只读查询。不论是自动查询、`POST /usage-lite/quotas/refresh` 还是旧 `?refresh=1`，都不写凭据。
+- 启用续期后，手动点「查询额度」只会为 **DSH 当前使用** 的 Codex 账号处理已过期或 `401`：同一轮最多续期一次并补查一次。`403`、`429`、网络异常、额度用尽等不会触发；也不会自动切号。续期成功、补查失败时保留新凭据并标明上次成功的额度时间。
+- Codex 多账号：用保存目录名作标签，不显示邮箱或令牌。当前账号使用实时记录，不读旧快照。已保存的非当前账号只有明确确认「切换使用」才可续期或激活；切换影响全局后续 GPT 请求，不需要重启。
+- 额度端点仅供 DSH 所有者使用。手动续期与切号的 JSON 写操作额外校验同源、操作标记及当前账号身份。活跃 Codex 记录只经宿主 `credentials.modifyRecord` 写入，与模型侧共锁；浏览器、日志、额度缓存、curl 命令参数均不接收令牌。续期结果不明时不自动重发旧令牌。
+- 测试：`node --test`（临时目录、伪造凭据及网络，不访问真实账号）。
+
+固定版本：`github:B612-LP/dsh-usage-lite#v1.2.1-b612.6`。额度所有者校验和凭据写操作需要已验证兼容的 DSH 宿主服务（Desktop `0.2.2-rc.3`）；缺少服务则不开放写入。
+
+**部署守则**：自动续期默认关闭。只有在停用或迁移所有直接覆盖 DSH Codex 记录的本机工具后，才能在 DSH home 下的 `usage-lite/codex-renewal-enabled` 放置权限 `0600`、内容恰为 `enabled` 加换行的普通文件。启用条件每次查询时读取；移除此文件即可停用自动续期，不重启、不回滚凭据。稳妥回退只关续期，保留走锁的切号实现。
 
 维护方式：上游更新后 `git fetch upstream && git merge upstream/main`，解决冲突后
-打新 tag（如 `v1.3.0-b612.1`），再把 DSH profile 依赖的 tag 钉子推进即可。
+打新 tag，再把 DSH profile 依赖的 tag 钉子推进即可。

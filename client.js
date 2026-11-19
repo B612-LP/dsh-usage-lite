@@ -23,6 +23,8 @@ window.__ModuleLoader__.load({
 			{ id: "30d", label: "近 30 天" },
 		];
 		const QUOTA_AUTO_REFRESH_MS = 10 * 60 * 1000;
+		const RENEWAL_POLL_MS = 400;
+		const RENEWAL_POLL_LIMIT = 75; // at most 30 seconds of status polling at the nominal cadence
 
 		// ── 纯函数：数字与日期 ────────────────────────────────────────────────
 		function formatInt(value) {
@@ -237,20 +239,33 @@ window.__ModuleLoader__.load({
 				e("div", { style: css.track }, e("div", { style: css.fill((pct ?? 0) / 100) })));
 		}
 
-		function QuotaProviderCard({ p }) {
+		function QuotaProviderCard({ p, onSwitch, switching = null, disabled = false, canSwitch = true }) {
 			const account = p.account;
+			const windows = p.windows ?? [];
+			const stale = p.status === "stale";
 			return e("div", { style: css.providerCard },
 				e("div", { style: css.providerHead },
 					e("span", { style: css.providerName }, p.label ?? p.id),
 					p.plan ? e("span", { style: css.planChip }, p.plan) : null,
-					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null),
+					account?.active === true ? e("span", { style: css.planChip }, "DSH 当前使用") : null,
+					canSwitch !== false && p.providerId === "openai-codex" && account?.switchable === true && account.active !== true
+						? e("button", {
+							type: "button",
+							style: { ...css.button, marginLeft: "auto", ...(disabled ? css.buttonDisabled : {}) },
+							disabled,
+							"aria-label": `切换使用 ${account.label}`,
+							onClick: () => { void onSwitch?.(p); },
+						}, switching === p.id ? "切换中…" : "切换使用") : null),
 				account ? e("div", { style: { ...css.muted, marginTop: 3, overflowWrap: "anywhere" } },
 					account.label) : null,
-				p.status === "ok"
+				stale ? e("div", { style: { ...css.error, marginTop: 6 } }, p.error ?? "额度信息未能更新，仍显示上次查询的结果。") : null,
+				stale && Number.isFinite(p.staleAt) ? e("div", { style: { ...css.muted, marginTop: 6 } },
+					`上次成功于 ${new Date(p.staleAt).toLocaleString("zh-CN", { hour12: false })}`) : null,
+				p.status === "ok" || stale
 					? [
-						...p.windows.map((w, i) => e(QuotaWindow, { key: `${p.id}\u0000${i}`, w })),
+						...windows.map((w, i) => e(QuotaWindow, { key: `${p.id}\u0000${i}`, w })),
 						p.note ? e("div", { style: { ...css.muted, marginTop: 6 } }, p.note) : null,
-						p.windows.length === 0 && !p.note ? e("div", { style: { ...css.muted, marginTop: 6 } }, "接口没有返回窗口额度。") : null,
+						p.status === "ok" && windows.length === 0 && !p.note ? e("div", { style: { ...css.muted, marginTop: 6 } }, "接口没有返回窗口额度。") : null,
 					]
 					: null,
 				p.status === "pending" ? e("div", { style: { ...css.muted, marginTop: 6 } }, "尚未查询。") : null,
@@ -258,42 +273,200 @@ window.__ModuleLoader__.load({
 				p.status === "error" ? e("div", { style: { ...css.error, marginTop: 6 } }, p.error ?? "查询失败。") : null);
 		}
 
+		function activeCodex(data) {
+			return data?.providers?.find((p) => p.providerId === "openai-codex" && p.account?.active === true);
+		}
+
+		async function readQuotaSnapshot() {
+			const response = await fetch(`/usage-lite/quotas?t=${Date.now()}`, { headers: { accept: "application/json" } });
+			if (!response.ok) throw new Error("quota snapshot unavailable");
+			const data = await response.json();
+			if (data?.ok !== true || !Array.isArray(data.providers)) throw new Error("invalid quota snapshot");
+			return data;
+		}
+
+		function watchQuotaRenewal(onStatus) {
+			const controller = new AbortController();
+			let timer;
+			let remaining = RENEWAL_POLL_LIMIT;
+			async function poll() {
+				if (controller.signal.aborted) return;
+				remaining--;
+				try {
+					const response = await fetch("/usage-lite/quotas/renewal-status", {
+						headers: { accept: "application/json" }, mode: "same-origin", cache: "no-store", redirect: "error",
+						signal: controller.signal,
+					});
+					if (response.status === 401 || response.status === 403) return;
+					if (response.ok) {
+						const data = await response.json();
+						if (!controller.signal.aborted && typeof data?.renewing === "boolean") onStatus(data.renewing);
+					}
+				} catch { /* Progress is advisory; the manual request owns the outcome. */ }
+				if (!controller.signal.aborted && remaining > 0) timer = setTimeout(poll, RENEWAL_POLL_MS);
+			}
+			timer = setTimeout(poll, RENEWAL_POLL_MS);
+			return () => {
+				clearTimeout(timer);
+				controller.abort();
+			};
+		}
+
 		function QuotaSection() {
-			const [state, setState] = React.useState({ data: null, busy: false, error: null });
-			const load = React.useCallback(async () => {
+			const [state, setState] = React.useState({ data: null, busy: false, renewing: false, error: null, switching: null, notice: null });
+			const operationLock = React.useRef(false);
+			const requestVersion = React.useRef(0);
+			const mounted = React.useRef(true);
+			const renewalPoll = React.useRef(null);
+			const refresh = React.useCallback(async (renew = null) => {
+				if (!mounted.current || operationLock.current) return;
+				operationLock.current = true;
+				const version = ++requestVersion.current;
+				const isCurrent = () => version === requestVersion.current;
+				setState((prev) => ({ ...prev, busy: true, renewing: false, error: null, notice: null }));
+				let stopPolling = null;
+				const stopProgress = () => {
+					if (stopPolling === null) return;
+					stopPolling();
+					if (renewalPoll.current === stopPolling) renewalPoll.current = null;
+					stopPolling = null;
+				};
 				try {
-					const response = await fetch(`/usage-lite/quotas?t=${Date.now()}`, { headers: { accept: "application/json" } });
-					if (!response.ok) throw new Error(`HTTP ${response.status}`);
+					if (renew) {
+						stopPolling = renewalPoll.current = watchQuotaRenewal((renewing) => {
+							if (isCurrent()) setState((prev) => prev.renewing === renewing ? prev : { ...prev, renewing });
+						});
+					}
+					const response = renew
+						? await fetch("/usage-lite/quotas/renew", {
+							method: "POST", mode: "same-origin", redirect: "error",
+							headers: { accept: "application/json", "content-type": "application/json", "x-usage-lite-action": "renew-codex" },
+							body: JSON.stringify(renew),
+						})
+						: await fetch("/usage-lite/quotas/refresh", { method: "POST", headers: { accept: "application/json" } });
+					stopProgress();
+					if (!isCurrent()) return;
+					if (response.status === 401 || response.status === 403) {
+						setState((prev) => ({ ...prev, error: "未获授权，请重新登录或刷新当前 DSH 页面后再查询。" }));
+						return;
+					}
+					if (renew && response.status === 409) {
+						// The authorized conflict may include a fresh snapshot. If not, only reconcile by GET.
+						const conflict = await response.json().catch(() => null);
+						if (!isCurrent()) return;
+						const data = Array.isArray(conflict?.providers) ? conflict : await readQuotaSnapshot().catch(() => null);
+						if (isCurrent()) setState((prev) => ({
+							...prev, data: data ?? prev.data,
+							error: "当前账号状态已变化，或已有操作正在进行。请核对「DSH 当前使用」标记；未自动重试续期。",
+						}));
+						return;
+					}
+					if (!response.ok) throw new Error("quota query failed");
 					const data = await response.json();
-					if (data?.ok !== true) throw new Error("unexpected payload");
-					setState((prev) => ({ ...prev, data, error: null }));
-					return data;
-				} catch (error) {
-					setState((prev) => ({ ...prev, error: String(error?.message ?? error) }));
-					return null;
+					if (data?.ok !== true || !Array.isArray(data.providers)) throw new Error("invalid quota snapshot");
+					if (renew && (activeCodex(data)?.id !== renew.expectedActiveId
+						|| data.activeAccountTag !== renew.expectedActiveAccountTag)) {
+						throw new Error("active account changed");
+					}
+					if (isCurrent()) setState((prev) => ({
+						...prev, data, notice: renew && typeof data.message === "string" && data.message ? data.message : null,
+					}));
+				} catch {
+					stopProgress();
+					if (!isCurrent()) return;
+					// A failed manual request may already have written credentials. Never repeat it or POST a fallback.
+					if (renew) setState((prev) => ({ ...prev, renewing: false }));
+					const data = renew ? await readQuotaSnapshot().catch(() => null) : null;
+					if (isCurrent()) setState((prev) => ({
+						...prev, data: data ?? prev.data,
+						error: renew ? "无法确认本次查询结果。请核对当前账号和额度；未自动重试续期。" : "查询失败，请稍后重试。",
+					}));
+				} finally {
+					stopProgress();
+					if (isCurrent()) {
+						operationLock.current = false;
+						setState((prev) => ({ ...prev, busy: false, renewing: false }));
+					}
 				}
 			}, []);
-			const refresh = React.useCallback(async () => {
-				setState((prev) => ({ ...prev, busy: true, error: null }));
-				try {
-					const response = await fetch("/usage-lite/quotas/refresh", { method: "POST", headers: { accept: "application/json" } });
-					if (!response.ok) throw new Error(`HTTP ${response.status}`);
-					const data = await response.json();
-					if (data?.ok !== true) throw new Error("unexpected payload");
-					setState((prev) => ({ ...prev, data, busy: false }));
-				} catch (error) {
-					setState((prev) => ({ ...prev, busy: false, error: `查询失败：${String(error?.message ?? error)}（也可稍后重试）` }));
+			const switchAccount = async (target) => {
+				if (!mounted.current || operationLock.current || state.data?.canSwitch === false
+					|| target.providerId !== "openai-codex" || target.account?.switchable !== true || target.account.active === true) return;
+				const active = activeCodex(state.data);
+				const activeTag = active ? state.data.activeAccountTag : null;
+				if (active && (typeof activeTag !== "string" || !activeTag)) {
+					setState((prev) => ({ ...prev, notice: null, error: "无法确认当前账号，请刷新页面后再切换。" }));
+					return;
 				}
-			}, []);
+				// Only this explicit confirmation can dispatch the write request.
+				if (!window.confirm(`确认全局切换 GPT 订阅？\n\n从：${active?.account.label ?? "未连接"}\n切换到：${target.account.label}\n\n此后所有 GPT 会话的新模型请求（含后续自动执行）都会使用这个账号，不只是当前对话。不会清空对话或重启 DSH；已发出的请求不主动中断。`)) return;
+				operationLock.current = true;
+				const version = ++requestVersion.current;
+				const isCurrent = () => version === requestVersion.current;
+				setState((prev) => ({ ...prev, switching: target.id, error: null, notice: null }));
+				try {
+					const response = await fetch("/usage-lite/accounts/switch", {
+						method: "POST",
+						headers: { accept: "application/json", "content-type": "application/json", "x-usage-lite-action": "switch-account" },
+						body: JSON.stringify({ id: target.id, expectedActiveId: active?.id ?? null, expectedActiveAccountTag: activeTag, confirmed: true }),
+					});
+					if (!isCurrent()) return;
+					if (response.status === 401 || response.status === 403) {
+						setState((prev) => ({ ...prev, error: "未获授权，请重新登录或从当前 DSH 页面切换账号。" }));
+						return;
+					}
+					const data = await response.json();
+					if (!response.ok || data?.ok !== true || activeCodex(data)?.id !== target.id) throw new Error("switch outcome not confirmed");
+					if (isCurrent()) setState((prev) => ({
+						...prev, data, notice: `已全局切换到 ${target.account.label}，之后所有 GPT 新请求使用此账号。`,
+					}));
+				} catch {
+					if (!isCurrent()) return;
+					const data = await readQuotaSnapshot().catch(() => null);
+					if (isCurrent()) setState((prev) => ({
+						...prev, data: data ?? prev.data, error: "切换结果未确认。请核对「DSH 当前使用」标记；未自动重试切换。",
+					}));
+				} finally {
+					if (isCurrent()) {
+						operationLock.current = false;
+						setState((prev) => ({ ...prev, switching: null }));
+					}
+				}
+			};
 			React.useEffect(() => {
+				mounted.current = true;
+				const version = ++requestVersion.current;
 				void (async () => {
-					// Auto-refresh on open unless the snapshot was queried recently.
-					const data = await load();
-					const queriedAt = data?.queriedAt;
-					if (typeof queriedAt !== "number" || Date.now() - queriedAt >= QUOTA_AUTO_REFRESH_MS) await refresh();
+					try {
+						const data = await readQuotaSnapshot();
+						if (version !== requestVersion.current) return;
+						setState((prev) => ({ ...prev, data, error: null }));
+						const queriedAt = data.queriedAt;
+						// Page opens may refresh a stale snapshot, but cannot renew credentials.
+						if (typeof queriedAt !== "number" || Date.now() - queriedAt >= QUOTA_AUTO_REFRESH_MS) await refresh();
+					} catch {
+						if (version === requestVersion.current) setState((prev) => ({ ...prev, error: "读取额度失败，可尝试手动查询。" }));
+					}
 				})();
-			}, [load, refresh]);
+				return () => {
+					mounted.current = false;
+					++requestVersion.current;
+					operationLock.current = false;
+					renewalPoll.current?.();
+					renewalPoll.current = null;
+				};
+			}, [refresh]);
 			const queriedAt = state.data?.queriedAt;
+			const disabled = state.busy || state.switching !== null;
+			const canSwitch = state.data?.canSwitch !== false;
+			const queryOnClick = () => {
+				const active = activeCodex(state.data);
+				const tag = state.data?.activeAccountTag;
+				const renew = state.data?.canRenew === true && typeof active?.id === "string" && active.id
+					&& typeof tag === "string" && tag
+					? { expectedActiveId: active.id, expectedActiveAccountTag: tag } : null;
+				return refresh(renew);
+			};
 			return e("div", null,
 				e("div", { style: css.headRow },
 					e("div", { style: { ...css.sectionTitle, margin: 0 } }, "订阅额度"),
@@ -303,13 +476,19 @@ window.__ModuleLoader__.load({
 							: `查询于 ${new Date(queriedAt).toLocaleTimeString("zh-CN", { hour12: false })}`),
 					e("div", { style: { flex: 1 } }),
 					e("button", {
-						style: state.busy ? { ...css.button, ...css.buttonDisabled } : css.button,
-						disabled: state.busy === true,
-						onClick: () => { void refresh(); },
+						type: "button",
+						style: disabled ? { ...css.button, ...css.buttonDisabled } : css.button,
+						disabled,
+						onClick: queryOnClick,
 					}, state.busy ? "查询中…（几秒）" : "查询额度")),
-				state.error === null ? null : e("div", { style: css.error }, state.error),
+				state.renewing ? e("div", { role: "status", style: css.muted }, "正在续期当前账号…") : null,
+				state.error === null ? null : e("div", { role: "alert", style: css.error }, state.error),
+				state.notice === null ? null : e("div", { role: "status", style: css.muted }, state.notice),
+				canSwitch ? e("div", { style: { ...css.muted, margin: "4px 0 8px" } }, "切换为全局生效，影响所有 GPT 会话的新请求；点击后需再次确认。") : null,
 				e("div", { style: css.quotaGrid },
-					(state.data?.providers ?? []).map((p) => e(QuotaProviderCard, { key: p.id, p }))));
+					(state.data?.providers ?? []).map((p) => e(QuotaProviderCard, {
+						key: p.id, p, onSwitch: switchAccount, switching: state.switching, disabled, canSwitch,
+					}))));
 		}
 
 		function StatsPage() {

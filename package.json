@@ -1,9 +1,10 @@
 {
   "name": "dsh-usage-lite",
-  "version": "1.2.0",
+  "version": "1.2.1-b612.6",
   "description": "Token usage statistics across all sessions, rendered as a DeepSeek Harness settings page",
   "type": "module",
   "main": "./index.mjs",
+  "files": ["index.mjs", "account-switch.mjs", "codex-renewal.mjs", "quota-transport.mjs", "client.js", "cordis.patch.yml"],
   "exports": {
     ".": "./index.mjs",
     "./client": "./client.js",
