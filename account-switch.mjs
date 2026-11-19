@@ -1,12 +1,11 @@
 // Safe, preflight-first switching of the one global Codex credential record.
 // No CLI subprocess is used: neither tokens nor upstream responses reach errors/logs.
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, writeFileSync, renameSync, unlinkSync, chmodSync, mkdirSync, readdirSync } from "node:fs";
+import { lstatSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { accessExpired, accountTag, canModifyCodex, CODEX_KEY, CodexRenewalError, oauthPayload, rotateGrant, tokenAccountId } from "./codex-renewal.mjs";
 
-const KEY = "  llm-pi-ai/openai-codex:";
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const KEY = `  ${CODEX_KEY}:`;
 const flights = new Set();
 
 export class AccountSwitchError extends Error {
@@ -24,7 +23,7 @@ function scalar(value) {
   return value;
 }
 
-/** Narrow YAML editor: fail closed for ambiguous records; leave every other byte intact. */
+/** Reader/editor for legacy account snapshots only; never writes the live document. */
 export function codexRecord(text) {
   const lines = text.split("\n");
   const starts = lines.flatMap((line, i) => line === KEY ? [i] : []);
@@ -92,16 +91,13 @@ function readRegular(path) {
 }
 
 function atomicWrite(path, text, expected = undefined) {
-  let mode = 0o600;
   try {
     const existing = readRegular(path);
-    mode = existing.mode;
     if (expected !== undefined && existing.text !== expected) fail("凭据已发生变化，请刷新后重试", 409);
   } catch (error) { if (error?.code !== "ENOENT") throw error; if (expected !== undefined) throw error; }
   const tmp = `${path}.usage-lite-${randomUUID()}.tmp`;
   try {
-    writeFileSync(tmp, text, { flag: "wx", mode });
-    chmodSync(tmp, mode);
+    writeFileSync(tmp, text, { flag: "wx", mode: 0o600 });
     // Recheck after staging, before the atomic replacement.
     if (expected !== undefined && readRegular(path).text !== expected) fail("凭据已发生变化，请刷新后重试", 409);
     renameSync(tmp, path);
@@ -135,47 +131,32 @@ function saveSnapshot(home, label, block, fields) {
   atomicWrite(metaPath, `${JSON.stringify({ ...meta, label, accountId: fields.accountId, expires: Number(fields.expires) || null, savedAt: new Date().toISOString() }, null, 2)}\n`, oldMeta);
 }
 
-function claims(access) {
-  try { const value = JSON.parse(Buffer.from(access.split(".")[1], "base64url").toString()); return value && typeof value === "object" ? value : {}; } catch { return {}; }
-}
 function checkIdentity(fields, accountId) {
-  const claimed = claims(fields.access ?? "")["https://api.openai.com/auth"]?.chatgpt_account_id;
-  if (fields.accountId !== accountId || (claimed && claimed !== accountId)) fail("目标登录凭据与账号不一致，请重新登录");
-}
-function needsRefresh(fields) {
-  const expiries = [Number(fields.expires), Number(claims(fields.access ?? "").exp) * 1000].filter((value) => Number.isFinite(value) && value > 0);
-  return !fields.access || expiries.some((value) => value < Date.now() + 10 * 60 * 1000);
+  const claimed = tokenAccountId(fields.access);
+  if (fields.accountId !== accountId || (claimed !== undefined && claimed !== accountId)) fail("目标登录凭据与账号不一致，请重新登录");
 }
 
-export function createTokenRefresher(exec = execFile) {
-  return (refresh) => new Promise((resolve, reject) => {
-    const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || "http://127.0.0.1:7897";
-    const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }).toString();
-    const failed = () => reject(new AccountSwitchError("目标账号登录续期失败，请重新登录", 502));
-    try {
-      exec("/usr/bin/curl", ["-s", "-m", "20", "-x", proxy, "-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "--data-binary", body, "-w", "\n%{http_code}", "https://auth.openai.com/oauth/token"],
-        { timeout: 23000, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 1 << 20 }, (error, stdout) => {
-          if (error) return failed();
-          try {
-            const split = stdout.lastIndexOf("\n");
-            const json = JSON.parse(stdout.slice(0, split));
-            const seconds = Number(json.expires_in);
-            if (stdout.slice(split + 1).trim() !== "200" || typeof json.access_token !== "string" || !json.access_token || typeof json.refresh_token !== "string" || !json.refresh_token || !Number.isFinite(seconds) || seconds <= 0) return failed();
-            resolve({ access: json.access_token, refresh: json.refresh_token, expires: Date.now() + seconds * 1000 });
-          } catch { failed(); }
-        });
-    } catch { failed(); }
-  });
+function snapshotBlock(payload) {
+  // Quote arbitrary keys and serialize values as JSON (also valid flow YAML).
+  const lines = Object.entries(payload).filter(([, value]) => value !== undefined).map(([key, value]) =>
+    `      ${/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(key) ? key : JSON.stringify(key)}: ${JSON.stringify(value)}`);
+  return [KEY, "    kind: grant", "    payload:", ...lines].join("\n");
 }
 
 /** Preflight never installs a target until its authenticated quota request succeeds. */
-export async function switchCodexAccount({ dshHome, id, expectedActiveId, discover, queryQuota, refreshTokens = createTokenRefresher() }) {
+export async function switchCodexAccount({ dshHome, id, expectedActiveId, expectedActiveAccountTag, discover, queryQuota, credentials, refreshTokens, journal }) {
+  if (!canModifyCodex(credentials)) fail("当前环境不支持安全切换 Codex 账号", 503);
   if (flights.has(dshHome)) fail("已有账号切换正在进行，请稍候", 409);
   flights.add(dshHome);
   try {
     const accounts = await discover(dshHome);
     const active = accounts.find((entry) => entry.account.active);
-    if ((active?.id ?? null) !== expectedActiveId) fail("当前账号已变化，请刷新后重新确认", 409);
+    if ((active?.id ?? null) !== expectedActiveId || accountTag(active?.payload?.accountId) !== expectedActiveAccountTag) fail("当前账号已变化，请刷新后重新确认", 409);
+    const assertCurrent = (record) => {
+      const payload = oauthPayload(record);
+      if (active ? !payload || payload.accountId !== active.payload.accountId : record !== undefined) fail("当前账号已变化，请刷新后重新确认", 409);
+      return payload;
+    };
     const target = accounts.find((entry) => entry.id === id);
     if (!target?.account.switchable || target.providerId !== "openai-codex") fail("请选择可切换的已保存 Codex 账号");
     if (target.account.active) fail("该账号已经是当前账号", 409);
@@ -185,21 +166,27 @@ export async function switchCodexAccount({ dshHome, id, expectedActiveId, discov
     let { fields } = codexRecord(targetText);
     const accountId = target.payload.accountId;
     checkIdentity(fields, accountId);
-    const refresh = async () => {
-      if (typeof fields.refresh !== "string" || !fields.refresh) fail("目标账号登录已过期且无法续期，请重新登录");
-      let rotated;
-      try { rotated = await refreshTokens(fields.refresh); } catch { fail("目标账号登录续期失败，请重新登录", 502); }
-      if (typeof rotated?.access !== "string" || !rotated.access || typeof rotated.refresh !== "string" || !rotated.refresh || !(Number(rotated.expires) > Date.now())) fail("目标账号登录续期失败，请重新登录", 502);
-      fields = { ...fields, ...rotated };
-      // A refresh token may already have rotated server-side. Persist BEFORE any
-      // quota/identity validation (and never roll it back on a later failure).
-      const updated = withFields(targetText, { access: fields.access, refresh: fields.refresh, expires: fields.expires });
-      atomicWrite(targetPath, updated, targetText);
-      targetText = updated;
-      checkIdentity(fields, accountId);
+    const assertTarget = () => {
+      if (snapshotFolder(dshHome, target.account.label) !== dir || readRegular(targetPath).text !== targetText) fail("目标账号凭据已变化，请刷新后重试", 409);
     };
-    let refreshed = false;
-    if (needsRefresh(fields)) { await refresh(); refreshed = true; }
+    const refresh = async () => {
+      // A different Host may already have activated the target. Decide under
+      // the same lock as live activation and model OAuth; never rotate a stale copy.
+      await credentials.modifyRecord(CODEX_KEY, async (record) => {
+        assertCurrent(record);
+        assertTarget();
+        const { payload, attempt } = await rotateGrant(fields, { refreshTokens, journal });
+        // Persist the verified rotation before quota validation; never roll it back.
+        const updated = withFields(targetText, { access: payload.access, refresh: payload.refresh, expires: payload.expires });
+        atomicWrite(targetPath, updated, targetText);
+        targetText = updated;
+        fields = payload;
+        await attempt.committed();
+        return undefined;
+      });
+    };
+    const refreshed = !fields.access || accessExpired(fields, Date.now() + 10 * 60 * 1000);
+    if (refreshed) await refresh();
     let quota = await queryQuota(fields, target.account);
     // Unexpired but revoked access can still be recovered, once. Other errors
     // (network/403/etc.) never cause a speculative refresh/installation.
@@ -207,35 +194,32 @@ export async function switchCodexAccount({ dshHome, id, expectedActiveId, discov
     if (quota?.status !== "ok") fail("目标账号额度验证失败，未切换；请检查登录或网络后重试", 502);
     checkIdentity(fields, accountId);
 
-    // Network work is finished. Re-read the live record, retaining even token
-    // rotations that occurred during preflight, and never overwrite other records.
-    const latestAccounts = await discover(dshHome);
-    if ((latestAccounts.find((entry) => entry.account.active)?.id ?? null) !== expectedActiveId) fail("当前账号已变化，请刷新后重新确认", 409);
-    const livePath = join(dshHome, ".credentials.yaml");
-    const live = readRegular(livePath);
-    const current = codexRecord(live.text);
-    if (current.fields.accountId !== active?.payload?.accountId) fail("当前账号已变化，请刷新后重新确认", 409);
-    if (readRegular(targetPath).text !== targetText) fail("目标账号凭据已变化，请刷新后重试", 409);
-    // Save all named copies, not only _previous, so returning to this account
-    // cannot resurrect a stale refresh token from a named snapshot.
-    const labels = readdirSync(join(dshHome, "accounts"), { withFileTypes: true });
-    for (const entry of labels) {
-      if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "_previous") continue;
-      const folder = snapshotFolder(dshHome, entry.name);
-      let saved;
-      try { saved = codexRecord(readRegular(join(folder, "credential.yaml")).text); } catch { continue; }
-      if (saved.fields.accountId === current.fields.accountId) saveSnapshot(dshHome, entry.name, current.block, current.fields);
-    }
-    saveSnapshot(dshHome, "_previous", current.block, current.fields);
-    const backup = `${livePath}.bak-usage-lite-${randomUUID()}`;
-    writeFileSync(backup, live.text, { flag: "wx", mode: 0o600 });
-    const next = replaceRecord(live.text, codexRecord(targetText).block);
-    atomicWrite(livePath, next, live.text);
-    // No fallible persistence operations after installation. Active markers in
-    // the HTTP response are always rediscovered from disk, never assumed.
-    return { id: target.id, quota, message: "已切换全局 Codex 账号，无需重启 DSH" };
+    // No quota network work in the final transaction. Save the freshest departure
+    // grant (including a model rotation during preflight) under the DSH lock.
+    const stored = await credentials.modifyRecord(CODEX_KEY, async (record) => {
+      const current = assertCurrent(record);
+      assertTarget();
+      if (current) {
+        const block = snapshotBlock(current);
+        for (const entry of readdirSync(join(dshHome, "accounts"), { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "_previous") continue;
+          const folder = snapshotFolder(dshHome, entry.name);
+          let saved;
+          try { saved = codexRecord(readRegular(join(folder, "credential.yaml")).text); } catch { continue; }
+          if (saved.fields.accountId === current.accountId) saveSnapshot(dshHome, entry.name, block, current);
+        }
+        saveSnapshot(dshHome, "_previous", block, current);
+      }
+      const expires = Number(fields.expires);
+      return { kind: "grant", payload: { type: "oauth", accountId, access: fields.access,
+        ...(fields.refresh !== undefined ? { refresh: fields.refresh } : {}),
+        ...(Number.isFinite(expires) && expires > 0 ? { expires } : {}) } };
+    });
+    if (oauthPayload(stored)?.accountId !== accountId) fail("无法确认账号已切换，请刷新核对", 409);
+    return { id: target.id, accountId, quota, message: "已切换全局 Codex 账号，无需重启 DSH" };
   } catch (error) {
     if (error instanceof AccountSwitchError) throw error;
+    if (error instanceof CodexRenewalError) fail(error.kind === "rejected" ? "目标账号登录已过期且无法续期，请重新登录" : "目标账号续期结果未确认，未重发旧令牌", 502);
     throw new AccountSwitchError("账号切换失败，请检查本地凭据或网络后重试", 500);
   } finally { flights.delete(dshHome); }
 }

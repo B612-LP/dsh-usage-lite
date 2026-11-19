@@ -6,10 +6,10 @@ import { readFile } from 'node:fs/promises';
 const source = await readFile(new URL('./client.js', import.meta.url), 'utf8');
 const current = { id: 'openai-codex:alpha', providerId: 'openai-codex', account: { label: 'alpha', active: true, switchable: true } };
 const target = { id: 'openai-codex:beta', providerId: 'openai-codex', account: { label: 'beta', active: false, switchable: true } };
-const snapshot = { ok: true, providers: [current, target] };
-function setup({ confirm = () => true, fetch = async () => ({ ok: true, json: async () => switched }) } = {}) {
+const snapshot = { ok: true, activeAccountTag: 'opaque-alpha-tag', providers: [current, target] };
+function setup({ data = snapshot, confirm = () => true, fetch = async () => ({ ok: true, json: async () => switched }) } = {}) {
   let client;
-  let state = { data: snapshot, busy: false, error: null, switching: null, notice: null };
+  let state = { data, busy: false, error: null, switching: null, notice: null };
   const calls = [];
   const refs = [];
   let cursor = 0;
@@ -30,7 +30,7 @@ function setup({ confirm = () => true, fetch = async () => ({ ok: true, json: as
     render: () => { cursor = 0; return client.QuotaSection(); },
   };
 }
-const switched = { ok: true, providers: [{ ...current, account: { ...current.account, active: false } }, { ...target, account: { ...target.account, active: true } }] };
+const switched = { ok: true, activeAccountTag: 'opaque-beta-tag', providers: [{ ...current, account: { ...current.account, active: false } }, { ...target, account: { ...target.account, active: true } }] };
 function nodes(tree, predicate) {
   if (tree == null || typeof tree !== 'object') return [];
   if (Array.isArray(tree)) return tree.flatMap((n) => nodes(n, predicate));
@@ -77,9 +77,23 @@ test('confirmed switch sends exact guarded payload and uses server active identi
   const [url, options] = app.calls[0];
   assert.equal(url, '/usage-lite/accounts/switch');
   assert.equal(options.headers['x-usage-lite-action'], 'switch-account');
-  assert.deepEqual(JSON.parse(options.body), { id: target.id, expectedActiveId: current.id, confirmed: true });
+  assert.deepEqual(JSON.parse(options.body), { id: target.id, expectedActiveId: current.id, expectedActiveAccountTag: snapshot.activeAccountTag, confirmed: true });
   assert.equal(app.state.data.providers.find((p) => p.account.active).id, target.id);
   assert.match(app.state.notice, /已全局切换到 beta/);
+});
+
+test('switch fails closed when an active account lacks a tag; no active account uses null guards', async () => {
+  let prompts = 0;
+  const unconfirmed = setup({ data: { ...snapshot, activeAccountTag: undefined }, confirm: () => { prompts++; return true; } });
+  await handler(unconfirmed)(target);
+  assert.equal(prompts, 0);
+  assert.equal(unconfirmed.calls.length, 0);
+  assert.match(unconfirmed.state.error, /无法确认当前账号/);
+
+  const disconnected = setup({ data: { ...snapshot, activeAccountTag: null, providers: [target] } });
+  await handler(disconnected)(target);
+  assert.equal(disconnected.calls.length, 1);
+  assert.deepEqual(JSON.parse(disconnected.calls[0][1].body), { id: target.id, expectedActiveId: null, expectedActiveAccountTag: null, confirmed: true });
 });
 
 test('double clicks cannot dispatch concurrent switches or quota refreshes', async () => {

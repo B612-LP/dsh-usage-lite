@@ -12,15 +12,17 @@
 // 快照持久化到 ~/.dsh/usage-lite/index.json。
 // 请求路径非阻塞：/stats 立即返回内存快照，变更检测在后台进行（stale-while-revalidate）。
 // 本文件是纯 Node ESM，无构建步骤，不依赖第三方包。
-import { execFile } from "node:child_process";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { lstat, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
-import { AccountSwitchError, createTokenRefresher, switchCodexAccount } from "./account-switch.mjs";
+import { lstat, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { AccountSwitchError, switchCodexAccount } from "./account-switch.mjs";
+import { accessExpired, accountTag, canModifyCodex, CodexRenewalError, createRenewalJournal, jwtClaims, renewActiveCodex } from "./codex-renewal.mjs";
+import { codexProxy, createQuotaTransport, createTokenRefresher } from "./quota-transport.mjs";
 
 export const name = "dsh-usage-lite";
 
-export const inject = ["webServer", "sessionQuery"];
+export const inject = ["webServer", "sessionQuery"]; // Optional host services are fetched at the point of use.
 
 const ROUTE_PREFIX = "/usage-lite";
 const INDEX_VERSION = 1;
@@ -175,14 +177,6 @@ function recordPayload(text, id) {
 }
 
 
-/** Decode identity/expiry only; never return raw JWT data in quota responses. */
-function jwtClaims(access) {
-  try {
-    const claims = JSON.parse(Buffer.from(access.split(".")[1], "base64url").toString("utf8"));
-    return claims && typeof claims === "object" ? claims : {};
-  } catch { return {}; }
-}
-
 const identityEmail = (payload, meta = {}) => {
   const claims = jwtClaims(payload?.access ?? "");
   const email = claims.email || claims["https://api.openai.com/profile"]?.email || meta.email;
@@ -234,7 +228,7 @@ export async function discoverCodexAccounts(dshHome) {
 
 // ── 插件本体 ────────────────────────────────────────────────────────────────
 
-export function apply(ctx, { quotaExecFile = execFile } = {}) {
+export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshTokens = createTokenRefresher(quotaRequest), renewalEnabled } = {}) {
   const log = (level, message, error) => {
     const line = `[dsh-usage-lite] ${message}${error === void 0 ? "" : `: ${String(error?.stack ?? error)}`}`;
     try {
@@ -436,8 +430,8 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
   //     （credentials 记录 llm-pi-ai/openai-codex 的 access/accountId；必须走代理 + codex UA）
   //   * zai-coding-cn → GET open.bigmodel.cn/api/monitor/usage/quota/limit
   //     （credentials refs.ZAI_CODING_CN_API_KEY 的静态 key，国内直连）
-  // 凭据每次查询现读、绝不落日志；打开面板只展示上次缓存结果，点按钮才真正发请求。
-  const QUOTA_VERSION = 2;
+  // 凭据每次查询现读、绝不落日志；打开面板可只读刷新，手动操作才允许续期。
+  const QUOTA_VERSION = 3;
   const quotaFile = join(indexDir, "quotas.json");
   let quotaSnapshot = null;
   let quotaLoaded = false;
@@ -475,32 +469,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     return null;
   }
 
-  /** 走 curl 而不是 fetch：chatgpt.com 必须经代理，undici 默认不吃 HTTPS_PROXY。 */
-  function curlText(args, timeoutMs) {
-    return new Promise((resolve) => {
-      quotaExecFile("/usr/bin/curl", args, { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
-        if (error !== void 0 && error !== null) {
-          resolve({
-            ok: false,
-            body: "",
-            error: error.killed === true
-              ? `请求超时（${Math.round(timeoutMs / 1000)}s）`
-              : "网络请求失败（curl 执行失败）",
-          });
-          return;
-        }
-        resolve({ ok: true, body: stdout ?? "", error: null });
-      });
-    });
-  }
-
-  /** 末行是 curl -w 追加的 HTTP 状态码。 */
-  function splitCurlStatus(body) {
-    const idx = body.lastIndexOf("\n");
-    if (idx < 0) return { status: 0, text: body };
-    const status = Number(body.slice(idx + 1).trim());
-    return { status: Number.isInteger(status) && status > 0 ? status : 0, text: body.slice(0, idx) };
-  }
+  const networkError = (timedOut) => timedOut ? "网络不通：请求超时（12s）" : "网络请求失败，请稍后重试";
 
   function windowLabelFromSeconds(sec) {
     if (typeof sec !== "number" || !(sec > 0)) return "窗口";
@@ -509,33 +478,26 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     return `${Math.round(sec / 86400)} 天窗口`;
   }
 
-  async function queryCodexQuota(payload, account, forSwitch = false) {
+  async function queryCodexQuota(payload, account) {
     const base = { plan: null, windows: [], note: null, error: null };
     const access = typeof payload?.access === "string" ? payload.access : null;
     const accountId = typeof payload?.accountId === "string" ? payload.accountId : null;
+    const relogin = account.active
+      ? "当前账号登录凭据已过期或失效：可点「查询额度」尝试续期，或到设置 → 模型重新登录"
+      : `账号「${account.label}」登录凭据已过期：请切换到此账号并重新登录后再查（额度查询不会刷新令牌）`;
+    if (accountId && accessExpired(payload)) return { ...base, status: "error", expired: true, error: relogin };
     if (!access || !accountId) {
-      return { ...base, status: "unconfigured", error: "credentials 里没有 llm-pi-ai/openai-codex 记录（去设置 → 模型里登录 ChatGPT）" };
+      return { ...base, status: "unconfigured", error: "未找到 Codex 登录凭据，请到设置 → 模型登录" };
     }
-    const relogin = `账号「${account.label}」登录凭据已过期：请切换到此账号并重新登录后再查（额度查询不会刷新令牌）`;
-    const expiries = [Number(payload.expires), Number(jwtClaims(access).exp) * 1000];
-    if (expiries.some((expires) => expires > 0 && expires <= Date.now())) return { ...base, status: "error", error: relogin };
-    const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || "http://127.0.0.1:7897";
-    const { ok, body, error } = await curlText([
-      "-s", "-m", "12", "-x", proxy,
-      "-A", "codex_cli_rs/0.163.0",
-      "-H", `Authorization: Bearer ${access}`,
-      "-H", `chatgpt-account-id: ${accountId}`,
-      "-H", "originator: pi",
-      "-w", "\n%{http_code}",
-      "https://chatgpt.com/backend-api/wham/usage",
-    ], 15000);
-    if (!ok) return { ...base, status: "error", error: `网络不通：${error}` };
-    const { status, text } = splitCurlStatus(body);
+    const { status, text, timedOut } = await quotaRequest("https://chatgpt.com/backend-api/wham/usage", {
+      proxy: codexProxy(), headers: ["User-Agent: codex_cli_rs/0.163.0", `Authorization: Bearer ${access}`, `chatgpt-account-id: ${accountId}`, "originator: pi"],
+    });
+    if (!status) return { ...base, status: "error", error: networkError(timedOut) };
     if (status === 401 || status === 403) {
       return {
         ...base,
         status: "error",
-        ...(forSwitch && status === 401 ? { unauthorized: true } : {}),
+        ...(status === 401 ? { unauthorized: true } : {}),
         error: status === 401
           ? relogin
           : "被 Cloudflare/代理节点拦截（403）：跑一次 ~/.dsh/bin/ai-egress-guard.sh 换可用节点",
@@ -577,14 +539,10 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     const base = { plan: null, windows: [], note: null, error: null };
     const key = refValue(await readCredentials(), "ZAI_CODING_CN_API_KEY");
     if (!key) return { ...base, status: "unconfigured", error: "credentials refs 里没有 ZAI_CODING_CN_API_KEY" };
-    const { ok, body, error } = await curlText([
-      "-s", "-m", "12",
-      "-H", `Authorization: Bearer ${key}`,
-      "-w", "\n%{http_code}",
-      "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-    ], 15000);
-    if (!ok) return { ...base, status: "error", error: `网络不通：${error}` };
-    const { status, text } = splitCurlStatus(body);
+    const { status, text, timedOut } = await quotaRequest("https://open.bigmodel.cn/api/monitor/usage/quota/limit", {
+      headers: [`Authorization: Bearer ${key}`],
+    });
+    if (!status) return { ...base, status: "error", error: networkError(timedOut) };
     let json;
     try { json = JSON.parse(text); } catch {
       return { ...base, status: "error", error: `HTTP ${status}，响应不是 JSON` };
@@ -593,7 +551,7 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
       return {
         ...base,
         status: "error",
-        error: typeof json?.msg === "string" && json.msg !== "" ? `智谱接口：${json.msg}` : `HTTP ${status}`,
+        error: `HTTP ${status}：智谱额度查询失败`,
       };
     }
     // 智谱 2026-07 改版后是积分制：usage=窗口积分上限，currentValue=已用，remaining=剩余；
@@ -620,39 +578,65 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
 
   const dshHome = typeof dshHomePath === "function" ? dshHomePath("") : join(homedir(), ".dsh");
   const quotaBase = () => ({ status: "pending", plan: null, windows: [], note: null, error: null });
+  const credentials = () => ctx.get?.("credentials");
+  const connection = () => ctx.get?.("connection");
+  const canSwitch = () => canModifyCodex(credentials()) && typeof connection()?.admit === "function";
+  // Local opt-in only, after every legacy writer has been migrated or disabled.
+  const canRenew = async () => {
+    if (!canSwitch()) return false;
+    if (renewalEnabled !== undefined) return renewalEnabled === true;
+    const path = join(indexDir, "codex-renewal-enabled");
+    try {
+      const info = await lstat(path);
+      return info.isFile() && (info.mode & 0o077) === 0 && info.size === 8 && await readFile(path, "utf8") === "enabled\n";
+    } catch { return false; }
+  };
+  const journal = createRenewalJournal(join(indexDir, "codex-renewal-attempts"));
+  const activeOf = (accounts) => accounts.find((entry) => entry.account.active);
+  const activeTagOf = (active) => accountTag(active?.payload?.accountId);
+  const sameActive = (active, expected) => active?.id === expected.expectedActiveId && activeTagOf(active) === expected.expectedActiveAccountTag;
+  let manualFlight = null;
+  let renewing = false;
 
-  async function quotaProviders() {
-    const accounts = await discoverCodexAccounts(dshHome);
-    return [
-      ...accounts.map(({ payload, ...identity }) => ({ ...identity, label: "OpenAI Codex (ChatGPT)",
-        query: () => queryCodexQuota(payload, identity.account) })),
-      { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", query: queryGlmQuota },
-    ];
+  function publicAccount({ id, providerId, account: { label, active, switchable } }) {
+    return { id, providerId, label: "OpenAI Codex (ChatGPT)", account: { label, active, switchable } };
   }
 
   function emptyQuotaSnapshot() {
     return { version: QUOTA_VERSION, queriedAt: null, providers: [] };
   }
 
+  // Never attach an old card's result to a different account reusing its label.
+  function cachedQuota(snapshot, id, tag) {
+    return snapshot?.providers?.find((p) => p.id === id && p.accountTag === tag);
+  }
+
   // Discovery is local-only on every GET, including cached responses after a switch.
   async function currentQuotaSnapshot() {
     const snapshot = quotaSnapshot ?? emptyQuotaSnapshot();
-    const providers = await quotaProviders();
-    return { ...snapshot, providers: providers.map(({ query, ...identity }) => {
-      const cached = snapshot.providers.find((p) => p.id === identity.id);
-      return { ...quotaBase(), ...cached, ...identity };
-    }) };
+    const accounts = await discoverCodexAccounts(dshHome);
+    const identities = [
+      ...accounts.map((entry) => ({ ...publicAccount(entry), accountTag: accountTag(entry.payload?.accountId) })),
+      { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", accountTag: null },
+    ];
+    const switchable = canSwitch();
+    return { version: QUOTA_VERSION, queriedAt: snapshot.queriedAt, canSwitch: switchable, canRenew: await canRenew(),
+      activeAccountTag: activeTagOf(activeOf(accounts)), providers: identities.map(({ accountTag: tag, ...identity }) => {
+        const { accountTag: _, ...cached } = cachedQuota(snapshot, identity.id, tag) ?? {};
+        return { ...quotaBase(), ...cached, ...identity };
+      }),
+    };
   }
 
   async function persistQuotas() {
+    const tmp = `${quotaFile}.${randomUUID()}.tmp`;
     try {
-      await mkdir(indexDir, { recursive: true });
-      const tmp = `${quotaFile}.tmp`;
-      await writeFile(tmp, JSON.stringify(quotaSnapshot));
+      await mkdir(indexDir, { recursive: true, mode: 0o700 });
+      await writeFile(tmp, JSON.stringify(quotaSnapshot), { flag: "wx", mode: 0o600 });
       await rename(tmp, quotaFile);
-    } catch (error) {
-      log("warn", "quota snapshot persist failed", error);
-    }
+    } catch {
+      log("warn", "quota snapshot persist failed");
+    } finally { await unlink(tmp).catch(() => {}); }
   }
 
   async function loadQuotas() {
@@ -660,60 +644,122 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
       const raw = JSON.parse(await readFile(quotaFile, "utf8"));
       if (raw?.version === QUOTA_VERSION) quotaSnapshot = raw;
     } catch (error) {
-      if (error?.code !== "ENOENT") log("warn", "quota snapshot unreadable, ignoring", error);
+      if (error?.code !== "ENOENT") log("warn", "quota snapshot unreadable, ignoring");
     }
     quotaLoaded = true;
   }
 
-  /** 手动刷新：并发查所有 provider（单飞行），成功后落盘。 */
-  function runQuotaRefresh() {
+  let quotaLoad = null;
+  const ensureQuotas = () => quotaLoaded ? undefined : (quotaLoad ??= loadQuotas());
+
+  const failedQuota = (error) => ({ ...quotaBase(), status: "error", error });
+  const genericQuotaError = "额度查询失败，请稍后重试";
+  async function queryActiveQuota(entry) {
+    const { payload, account } = entry;
+    const initial = await queryCodexQuota(payload, account).catch(() => failedQuota(genericQuotaError));
+    if (!initial.expired && !initial.unauthorized) return initial;
+    let refreshed;
+    try {
+      if (!await canRenew()) throw new CodexRenewalError("unavailable");
+      refreshed = await renewActiveCodex({ credentials: credentials(), expected: payload, refreshTokens, journal,
+        onRenewing: (value) => { renewing = value; } });
+    } catch (error) {
+      if (error instanceof CodexRenewalError && error.kind === "conflict") throw new AccountSwitchError(error.message, 409);
+      return failedQuota(error instanceof CodexRenewalError ? error.message : genericQuotaError);
+    }
+    const result = await queryCodexQuota(refreshed.payload, account).catch(() => failedQuota(genericQuotaError));
+    if (result.status === "ok") return result;
+    if (refreshed.renewed) return failedQuota("登录已续期，额度暂未更新");
+    return failedQuota(result.unauthorized || result.expired ? "额度补查失败，请稍后再查或到设置 → 模型重新登录" : result.error);
+  }
+
+  function cacheCard(identity, result, time) {
+    const { expired, unauthorized, ...safe } = result;
+    const previous = cachedQuota(quotaSnapshot, identity.id, identity.accountTag);
+    if (safe.status === "ok") return { ...identity, ...safe, lastSuccessAt: time };
+    if (previous?.lastSuccessAt) return { ...identity, ...safe, status: "stale", plan: previous.plan,
+      windows: previous.windows, note: previous.note, lastSuccessAt: previous.lastSuccessAt, staleAt: previous.lastSuccessAt };
+    return { ...identity, ...safe };
+  }
+
+  async function runQuotaBatch(expected = null) {
+    const accounts = await discoverCodexAccounts(dshHome);
+    if (expected && !sameActive(activeOf(accounts), expected)) throw new AccountSwitchError("当前 Codex 账号已变化，请刷新后重试", 409);
+    const queries = accounts.map((entry) => ({
+      identity: { ...publicAccount(entry), accountTag: accountTag(entry.payload?.accountId) },
+      query: () => expected && entry.account.active ? queryActiveQuota(entry) : queryCodexQuota(entry.payload, entry.account),
+    }));
+    queries.push({ identity: { id: "zai-coding-cn", label: "智谱 GLM Coding Pro", accountTag: null }, query: queryGlmQuota });
+    const results = await Promise.all(queries.map(async ({ query, identity }) => {
+      try { return [identity, await query()]; }
+      catch (error) {
+        if (error instanceof AccountSwitchError) throw error;
+        return [identity, failedQuota(genericQuotaError)];
+      }
+    }));
+    if (expected && !sameActive(activeOf(await discoverCodexAccounts(dshHome)), expected)) throw new AccountSwitchError("当前 Codex 账号已变化，请刷新后重试", 409);
+    const queriedAt = Date.now();
+    quotaSnapshot = { version: QUOTA_VERSION, queriedAt, providers: results.map(([identity, quota]) => cacheCard(identity, quota, queriedAt)) };
+    await persistQuotas();
+  }
+
+  function runReadOnlyRefresh() {
+    if (manualFlight) return manualFlight.promise.catch(() => {});
     if (quotaRefresh === null) {
-      quotaRefresh = (async () => {
-        const providers = await quotaProviders();
-        const results = await Promise.all(providers.map(async ({ query, ...identity }) => {
-          try {
-            return { ...identity, ...(await query()) };
-          } catch (error) {
-            return { ...identity, ...quotaBase(), status: "error", error: "额度查询失败，请稍后重试" };
-          }
-        }));
-        quotaSnapshot = { version: QUOTA_VERSION, queriedAt: Date.now(), providers: results };
-        await persistQuotas();
-        return quotaSnapshot;
-      })()
-        .catch((error) => {
-          log("error", "quota refresh failed");
-          return quotaSnapshot ?? emptyQuotaSnapshot();
-        })
-        .finally(() => { quotaRefresh = null; });
+      quotaRefresh = runQuotaBatch().catch(() => { log("error", "quota refresh failed"); }).finally(() => { quotaRefresh = null; });
     }
     return quotaRefresh;
   }
 
+  function jsonRoute(res, status, payload) {
+    res.writeHead(status, JSON_HEADERS);
+    res.end(JSON.stringify(payload));
+  }
+
   async function quotasRoute(res, force) {
-    if (quotaLoaded === false) await loadQuotas();
-    if (force === true) await runQuotaRefresh();
-    const snapshot = await currentQuotaSnapshot();
-    res.writeHead(200, JSON_HEADERS);
-    res.end(JSON.stringify({ ok: true, ...snapshot }));
+    await ensureQuotas();
+    if (force) await runReadOnlyRefresh();
+    return jsonRoute(res, 200, { ok: true, ...await currentQuotaSnapshot() });
   }
 
   let switchingAccount = false;
 
-  function switchRequestHeaders(req) {
+  function admitOwner(req) {
     const headers = req.headers ?? {};
-    if (headers["x-usage-lite-action"] !== "switch-account") throw new AccountSwitchError("缺少账号切换确认请求头", 403);
-    if (typeof headers["content-type"] !== "string" || !/^application\/json(?:\s*;|\s*$)/i.test(headers["content-type"])) throw new AccountSwitchError("请求必须使用 application/json", 415);
+    const site = headers["sec-fetch-site"];
+    if (site === "cross-site" || (req.method === "POST" && site !== undefined && site !== "same-origin")) {
+      throw new AccountSwitchError("拒绝跨来源请求", 403);
+    }
     if (headers.origin !== undefined) {
       try {
         const origin = new URL(headers.origin);
-        const expected = new URL(`${req.socket?.encrypted ? "https" : "http"}://${headers.host}`);
-        if (typeof headers.origin !== "string" || headers.origin !== origin.origin || origin.origin !== expected.origin || !headers.host || !["http:", "https:"].includes(origin.protocol)) throw new Error();
-      } catch { throw new AccountSwitchError("拒绝跨来源账号切换请求", 403); }
+        if (headers.origin !== origin.origin || !["http:", "https:"].includes(origin.protocol)) throw new Error();
+      } catch { throw new AccountSwitchError("拒绝跨来源请求", 403); }
     }
+    const hostConnection = connection();
+    if (typeof hostConnection?.admit !== "function") throw new AccountSwitchError("当前宿主不支持安全额度查询", 503);
+    const admission = hostConnection.admit(req);
+    if (admission?.rejection === 401) throw new AccountSwitchError("请先登录 DSH", 401);
+    if (admission?.peer?.principal?.kind !== "owner") throw new AccountSwitchError("仅 DSH 所有者可访问账号额度", 403);
   }
 
-  function switchRequestBody(req) {
+  function authorizeAction(req, action) {
+    const headers = req.headers ?? {};
+    if (headers["x-usage-lite-action"] !== action) throw new AccountSwitchError("缺少明确操作确认请求头", 403);
+    if (typeof headers["content-type"] !== "string" || !/^application\/json(?:\s*;|\s*$)/i.test(headers["content-type"])) throw new AccountSwitchError("请求必须使用 application/json", 415);
+  }
+
+  const validId = (value) => typeof value === "string" && value.startsWith("openai-codex:") && value.length <= 512;
+  const validTag = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const matchesKeys = (body, keys) => body && typeof body === "object" && !Array.isArray(body)
+    && Object.keys(body).length === keys.length && keys.every((key) => Object.hasOwn(body, key));
+  const validManualBody = (body) => matchesKeys(body, ["expectedActiveId", "expectedActiveAccountTag"])
+    && validId(body.expectedActiveId) && validTag(body.expectedActiveAccountTag);
+  const validSwitchBody = (body) => matchesKeys(body, ["id", "expectedActiveId", "expectedActiveAccountTag", "confirmed"])
+    && body.confirmed === true && validId(body.id) && ((body.expectedActiveId === null && body.expectedActiveAccountTag === null)
+      || (validId(body.expectedActiveId) && validTag(body.expectedActiveAccountTag)));
+
+  function actionRequestBody(req, validate) {
     return new Promise((resolve, reject) => {
       let bytes = 0;
       let done = false;
@@ -737,9 +783,9 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
       const end = () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 3 || !Object.keys(body).every((key) => ["id", "expectedActiveId", "confirmed"].includes(key)) || body.confirmed !== true || typeof body.id !== "string" || body.id.length > 512 || !(body.expectedActiveId === null || (typeof body.expectedActiveId === "string" && body.expectedActiveId.length <= 512))) throw new Error();
+          if (!validate(body)) throw new Error();
           finish(null, body);
-        } catch { finish(new AccountSwitchError("无效的账号切换参数，请重新确认", 400)); }
+        } catch { finish(new AccountSwitchError("无效的账号操作参数，请刷新后重试", 400)); }
       };
       const timer = setTimeout(() => finish(new AccountSwitchError("请求体读取超时", 408)), 5000);
       req.on("data", data);
@@ -749,40 +795,54 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
     });
   }
 
+  async function manualQuotaRoute(req, res) {
+    authorizeAction(req, "renew-codex");
+    const expected = await actionRequestBody(req, validManualBody);
+    if (!await canRenew()) throw new AccountSwitchError("当前环境未启用 Codex 自动续期，请到设置 → 模型重新登录", 503);
+    if (switchingAccount) throw new AccountSwitchError("正在切换 Codex 账号，请稍后再查询", 409);
+    if (manualFlight && (manualFlight.expected.expectedActiveId !== expected.expectedActiveId
+      || manualFlight.expected.expectedActiveAccountTag !== expected.expectedActiveAccountTag)) {
+      throw new AccountSwitchError("当前 Codex 账号已变化，请刷新后重试", 409);
+    }
+    if (!manualFlight) {
+      const promise = (async () => {
+        await ensureQuotas();
+        await quotaRefresh; // A read-only refresh already started must not publish after this batch.
+        await runQuotaBatch(expected);
+      })().finally(() => { manualFlight = null; });
+      manualFlight = { expected, promise };
+    }
+    await manualFlight.promise;
+    const snapshot = await currentQuotaSnapshot();
+    if (snapshot.activeAccountTag !== expected.expectedActiveAccountTag
+      || snapshot.providers.find((provider) => provider.account?.active)?.id !== expected.expectedActiveId) {
+      throw new AccountSwitchError("当前 Codex 账号已变化，请刷新后重试", 409);
+    }
+    return jsonRoute(res, 200, { ok: true, ...snapshot });
+  }
+
   async function accountSwitchRoute(req, res) {
-    const respond = async (status, result, expectedId = null) => {
-      if (quotaLoaded === false) await loadQuotas();
-      const snapshot = await currentQuotaSnapshot();
-      if (expectedId !== null && snapshot.providers.find((provider) => provider.account?.active)?.id !== expectedId) {
-        status = 409;
-        result = { ok: false, error: "切换后当前账号再次发生变化，请刷新核对" };
-      }
-      res.writeHead(status, JSON_HEADERS);
-      res.end(JSON.stringify({ ...snapshot, ...result }));
-    };
-    try { switchRequestHeaders(req); } catch (error) { return respond(error.status, { ok: false, error: error.message }); }
-    if (switchingAccount) return respond(409, { ok: false, error: "已有账号切换正在进行，请稍候" });
+    authorizeAction(req, "switch-account");
+    const body = await actionRequestBody(req, validSwitchBody);
+    if (!canSwitch()) throw new AccountSwitchError("当前环境不支持安全切换 Codex 账号", 503);
+    if (switchingAccount || manualFlight) throw new AccountSwitchError("已有 Codex 账号操作正在进行，请稍候", 409);
     switchingAccount = true;
     try {
-      const body = await switchRequestBody(req);
-      if (quotaLoaded === false) await loadQuotas();
-      const result = await switchCodexAccount({
-        dshHome, ...body, discover: discoverCodexAccounts,
-        queryQuota: (payload, account) => queryCodexQuota(payload, account, true),
-        refreshTokens: createTokenRefresher(quotaExecFile),
-      });
-      // Installing credentials is the transaction. Cache maintenance is only
-      // best-effort and must not turn an already completed switch into failure.
-      try {
-        const snapshot = await currentQuotaSnapshot();
-        quotaSnapshot = { ...snapshot, queriedAt: Date.now(), providers: snapshot.providers.map((provider) => provider.id === result.id ? { ...provider, ...result.quota } : provider) };
-        await persistQuotas();
-      } catch { log("warn", "quota cache update after account switch failed"); }
-      return await respond(200, { ok: true, message: result.message }, result.id);
-    } catch (error) {
-      return await respond(error instanceof AccountSwitchError ? error.status : 500, {
-        ok: false, error: error instanceof AccountSwitchError ? error.message : "账号切换失败，请稍后重试",
-      });
+      await ensureQuotas();
+      const result = await switchCodexAccount({ dshHome, ...body, discover: discoverCodexAccounts,
+        queryQuota: queryCodexQuota, credentials: credentials(), refreshTokens, journal });
+      // Credentials are already committed. Cache writes remain best-effort.
+      await quotaRefresh;
+      const queriedAt = Date.now();
+      const identity = { id: result.id, accountTag: accountTag(result.accountId) };
+      const snapshot = quotaSnapshot ?? emptyQuotaSnapshot();
+      quotaSnapshot = { ...snapshot, queriedAt, providers: [ ...snapshot.providers.filter((p) => p.id !== result.id), cacheCard(identity, result.quota, queriedAt) ] };
+      await persistQuotas();
+      const view = await currentQuotaSnapshot();
+      if (view.activeAccountTag !== identity.accountTag || view.providers.find((p) => p.account?.active)?.id !== result.id) {
+        throw new AccountSwitchError("切换后当前账号再次发生变化，请刷新核对", 409);
+      }
+      return jsonRoute(res, 200, { ok: true, message: result.message, ...view });
     } finally { switchingAccount = false; }
   }
 
@@ -806,11 +866,22 @@ export function apply(ctx, { quotaExecFile = execFile } = {}) {
         res.end(JSON.stringify({ ok: true, at: Date.now() }));
         return;
       }
-      if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/quotas`) {
-        return quotasRoute(res, url.searchParams.get("refresh") === "1");
+      const path = url.pathname.slice(ROUTE_PREFIX.length);
+      const key = `${req.method} ${path}`;
+      if (["GET /quotas", "GET /quotas/renewal-status", "POST /quotas/refresh", "POST /quotas/renew", "POST /accounts/switch"].includes(key)) {
+        try {
+          admitOwner(req);
+          if (key === "GET /quotas") return await quotasRoute(res, url.searchParams.get("refresh") === "1");
+          if (key === "GET /quotas/renewal-status") return jsonRoute(res, 200, { ok: true, renewing });
+          if (key === "POST /quotas/refresh") return await quotasRoute(res, true);
+          if (key === "POST /quotas/renew") return await manualQuotaRoute(req, res);
+          return await accountSwitchRoute(req, res);
+        } catch (error) {
+          return jsonRoute(res, error instanceof AccountSwitchError ? error.status : 500, {
+            ok: false, error: error instanceof AccountSwitchError ? error.message : "账号额度操作失败，请刷新后核对",
+          });
+        }
       }
-      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/quotas/refresh`) return quotasRoute(res, true);
-      if (req.method === "POST" && url.pathname === `${ROUTE_PREFIX}/accounts/switch`) return accountSwitchRoute(req, res);
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("not found");
     },
