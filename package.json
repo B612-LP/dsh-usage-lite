@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-lite",
-  "version": "1.2.1-b612.6",
+  "version": "1.2.1-b612.7",
   "description": "Token usage statistics across all sessions, rendered as a DeepSeek Harness settings page",
   "type": "module",
   "main": "./index.mjs",

@@ -579,8 +579,7 @@ export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshToken
   const dshHome = typeof dshHomePath === "function" ? dshHomePath("") : join(homedir(), ".dsh");
   const quotaBase = () => ({ status: "pending", plan: null, windows: [], note: null, error: null });
   const credentials = () => ctx.get?.("credentials");
-  const connection = () => ctx.get?.("connection");
-  const canSwitch = () => canModifyCodex(credentials()) && typeof connection()?.admit === "function";
+  const canSwitch = () => canModifyCodex(credentials());
   // Local opt-in only, after every legacy writer has been migrated or disabled.
   const canRenew = async () => {
     if (!canSwitch()) return false;
@@ -724,7 +723,7 @@ export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshToken
 
   let switchingAccount = false;
 
-  function admitOwner(req) {
+  function authorizeOwner(req, peer) {
     const headers = req.headers ?? {};
     const site = headers["sec-fetch-site"];
     if (site === "cross-site" || (req.method === "POST" && site !== undefined && site !== "same-origin")) {
@@ -736,11 +735,9 @@ export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshToken
         if (headers.origin !== origin.origin || !["http:", "https:"].includes(origin.protocol)) throw new Error();
       } catch { throw new AccountSwitchError("拒绝跨来源请求", 403); }
     }
-    const hostConnection = connection();
-    if (typeof hostConnection?.admit !== "function") throw new AccountSwitchError("当前宿主不支持安全额度查询", 503);
-    const admission = hostConnection.admit(req);
-    if (admission?.rejection === 401) throw new AccountSwitchError("请先登录 DSH", 401);
-    if (admission?.peer?.principal?.kind !== "owner") throw new AccountSwitchError("仅 DSH 所有者可访问账号额度", 403);
+    // WebServer admits the request and supplies the authenticated Peer.
+    if (peer == null) throw new AccountSwitchError("请先登录 DSH", 401);
+    if (peer.principal?.kind !== "owner") throw new AccountSwitchError("仅 DSH 所有者可访问账号额度", 403);
   }
 
   function authorizeAction(req, action) {
@@ -858,7 +855,8 @@ export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshToken
   ctx.effect(() => ctx.webServer.register({
     kind: "prefix",
     path: ROUTE_PREFIX,
-    handler: async (req, res) => {
+    auth: "required",
+    handler: async (req, res, peer) => {
       const url = new URL(req.url ?? "/", "http://local");
       if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/stats`) return statsHandler(req, res);
       if (req.method === "GET" && url.pathname === `${ROUTE_PREFIX}/health`) {
@@ -870,7 +868,7 @@ export function apply(ctx, { quotaRequest = createQuotaTransport(), refreshToken
       const key = `${req.method} ${path}`;
       if (["GET /quotas", "GET /quotas/renewal-status", "POST /quotas/refresh", "POST /quotas/renew", "POST /accounts/switch"].includes(key)) {
         try {
-          admitOwner(req);
+          authorizeOwner(req, peer);
           if (key === "GET /quotas") return await quotasRoute(res, url.searchParams.get("refresh") === "1");
           if (key === "GET /quotas/renewal-status") return jsonRoute(res, 200, { ok: true, renewing });
           if (key === "POST /quotas/refresh") return await quotasRoute(res, true);

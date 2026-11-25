@@ -79,7 +79,7 @@ dsh plugin add github:ChrisLou-bioinfo/dsh-usage-lite
 - 额度端点仅供 DSH 所有者使用。手动续期与切号的 JSON 写操作额外校验同源、操作标记及当前账号身份。活跃 Codex 记录只经宿主 `credentials.modifyRecord` 写入，与模型侧共锁；浏览器、日志、额度缓存、curl 命令参数均不接收令牌。续期结果不明时不自动重发旧令牌。
 - 测试：`node --test`（临时目录、伪造凭据及网络，不访问真实账号）。
 
-固定版本：`github:B612-LP/dsh-usage-lite#v1.2.1-b612.6`。额度所有者校验和凭据写操作需要已验证兼容的 DSH 宿主服务（Desktop `0.2.2-rc.3`）；缺少服务则不开放写入。
+固定版本：`github:B612-LP/dsh-usage-lite#v1.2.1-b612.7`。额度路由使用 DSH WebServer 传入的已认证所有者身份，不重复登录校验；已在 Desktop `0.2.3-alpha.2` 验证。没有所有者身份则拒绝额度请求，没有 `credentials.modifyRecord` 则不开放凭据写入。
 
 **部署守则**：自动续期默认关闭。只有在停用或迁移所有直接覆盖 DSH Codex 记录的本机工具后，才能在 DSH home 下的 `usage-lite/codex-renewal-enabled` 放置权限 `0600`、内容恰为 `enabled` 加换行的普通文件。启用条件每次查询时读取；移除此文件即可停用自动续期，不重启、不回滚凭据。稳妥回退只关续期，保留走锁的切号实现。
 

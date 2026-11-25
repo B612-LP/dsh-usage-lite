@@ -79,16 +79,14 @@ const protectedRoutes = [
   ["/usage-lite/accounts/switch", { method: "POST", body: { id: "openai-codex:beta", expectedActiveId: "openai-codex:current", expectedActiveAccountTag: accountTag("a"), confirmed: true }, headers: { "x-usage-lite-action": "switch-account" } }],
 ];
 
-test("all quota and switch routes fail closed for missing, rejected, or non-owner DSH admissions", async (t) => {
+test("all quota and switch routes fail closed without an owner Peer supplied by the host", async (t) => {
   const f = await fixture(t);
   await f.current(grant("a"));
   await f.snapshot("beta", grant("b"));
-  for (const [connection, status] of [
-    [{ admit: () => ({ rejection: 401 }) }, 401], [{ admit: () => ({ rejection: 403 }) }, 403],
-    [{ admit: () => ({ peer: { principal: { kind: "guest" } } }) }, 403], [null, 503],
-  ]) {
+  for (const [peer, status] of [[null, 401], [{ principal: { kind: "guest" } }, 403]]) {
     const before = await f.live();
-    const h = host(t, f, { connection, renewalEnabled: true });
+    const h = host(t, f, { peer, renewalEnabled: true });
+    assert.equal(h.auth, "required");
     for (const [path, options] of protectedRoutes) {
       const result = await h.request(path, options);
       assert.equal(result.status, status, path);
@@ -98,7 +96,6 @@ test("all quota and switch routes fail closed for missing, rejected, or non-owne
     }
     assert.deepEqual(h.requests, []);
     assert.deepEqual(h.refreshes, []);
-    assert.equal(h.admits.length, connection ? protectedRoutes.length : 0);
     assert.equal(f.store.calls, 0);
     assert.equal(await f.live(), before);
   }
@@ -117,11 +114,31 @@ test("admitted Desktop and same-origin TLS proxy can refresh quota without local
     assert.equal(result.status, 200);
     assert.equal(result.providers.find((p) => p.account?.active).status, "ok");
   }
-  const blocked = await h.request(path, { method: "POST", headers: {
-    origin: "https://other.example.test", host: "proxy.example.test", "x-forwarded-host": "other.example.test", "x-forwarded-proto": "https",
-  } });
-  assert.equal(blocked.status, 403);
-  assert.equal(h.admits.length, 3);
+  for (const headers of [
+    { origin: "https://other.example.test", host: "proxy.example.test", "x-forwarded-host": "other.example.test", "x-forwarded-proto": "https" },
+    { "sec-fetch-site": "same-site" },
+    { "sec-fetch-site": "cross-site" },
+  ]) {
+    assert.equal((await h.request(path, { method: "POST", headers })).status, 403);
+  }
   assert.equal(h.requests.length, 2);
+  assert.equal(f.store.calls, 0);
+});
+
+test("an owner can read and refresh without a writable Credentials service", async (t) => {
+  const f = await fixture(t);
+  await f.current(grant("a"));
+  const h = host(t, f, { credentials: null, renewalEnabled: true, quotaRequest: async () => quotaReply() });
+  for (const refresh of [false, true]) {
+    const result = await h.get(refresh);
+    assert.equal(result.status, 200);
+    assert.equal(result.canSwitch, false);
+    assert.equal(result.canRenew, false);
+  }
+  for (const [path, options] of protectedRoutes.slice(-2)) {
+    assert.equal((await h.request(path, options)).status, 503);
+  }
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.refreshes.length, 0);
   assert.equal(f.store.calls, 0);
 });

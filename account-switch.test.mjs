@@ -263,7 +263,6 @@ test("a trusted HTTPS proxy can switch from an empty live record with a null exp
     origin: "https://example.test", host: "example.test",
   }, { encrypted: false });
   assert.equal(result.status, 200);
-  assert.equal(h.admits.length, 1);
   assert.equal(f.store.writes, 1);
   assert.equal((await f.store.read()).payload.accountId, "b");
 });

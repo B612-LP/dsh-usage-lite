@@ -93,36 +93,32 @@ export async function fixture(t) {
   return { home, live, livePath, current, snapshot, saved, store };
 }
 
-const owner = { peer: { principal: { kind: "owner" } } };
-function admitFixture(req) {
-  const { origin, host, "sec-fetch-site": fetchSite } = req.headers;
-  // Models DSH's authority comparison, not its peer lookup. For a TLS proxy,
-  // Host retains the public authority and Origin supplies the scheme; no X-Forwarded-* trust.
-  if (!host || fetchSite === "cross-site") return { rejection: 403 };
-  if (origin === undefined) return owner;
+const owner = { principal: { kind: "owner" } };
+function trustedAuthority({ origin, host }) {
+  // Model the carrier's check before it calls the handler. The carrier retains
+  // the public Host on a TLS proxy; X-Forwarded-* does not authorize requests.
+  if (!host) return false;
+  if (origin === undefined) return true;
   try {
     const url = new URL(origin);
-    if (!["http:", "https:"].includes(url.protocol) || url.host !== new URL(`${url.protocol}//${host}`).host) return { rejection: 403 };
-    return owner;
-  } catch { return { rejection: 403 }; }
+    return ["http:", "https:"].includes(url.protocol) && url.host === new URL(`${url.protocol}//${host}`).host;
+  } catch { return false; }
 }
 
-export function host(t, f, { quotaRequest = async () => assert.fail("unexpected quota request"), refreshTokens = async () => assert.fail("unexpected token refresh"), renewalEnabled = false, credentials = f.store, connection = { admit: admitFixture } } = {}) {
-  let handler;
+export function host(t, f, { quotaRequest = async () => assert.fail("unexpected quota request"), refreshTokens = async () => assert.fail("unexpected token refresh"), renewalEnabled = false, credentials = f.store, peer = owner } = {}) {
+  let route;
   const cleanups = [];
   const logs = [];
-  const admits = [];
   const requests = [];
   const refreshes = [];
   apply({
     get: (name) => ({
       dshHomePath: (...parts) => join(f.home, ...parts),
       credentials,
-      connection: connection && { admit(req) { admits.push(req); return connection.admit(req); } },
     })[name],
     logger: { warn: (...args) => logs.push(args.join(" ")), error: (...args) => logs.push(args.join(" ")) },
     sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
-    webServer: { register: (route) => { handler = route.handler; } },
+    webServer: { register: (entry) => { route = entry; } },
     effect: (fn) => { const cleanup = fn(); if (cleanup) cleanups.push(cleanup); },
   }, {
     quotaRequest(url, options) { requests.push({ url, ...options }); return quotaRequest(url, options); },
@@ -131,15 +127,17 @@ export function host(t, f, { quotaRequest = async () => assert.fail("unexpected 
   });
   t.after(() => cleanups.forEach((fn) => fn()));
   return {
-    logs, admits, requests, refreshes,
+    logs, requests, refreshes,
+    get auth() { return route.auth; },
     async request(path, { method = "GET", body, headers = {}, socket = {} } = {}) {
       const req = Readable.from(body === undefined ? [] : [typeof body === "string" ? body : JSON.stringify(body)]);
       req.method = method;
       req.url = path;
       req.socket = socket;
       req.headers = { host: "localhost:1234", origin: "http://localhost:1234", "content-type": "application/json; charset=utf-8", ...headers };
+      if (!trustedAuthority(req.headers)) return { ok: false, status: 403 };
       let status, result;
-      await handler(req, { writeHead(code) { status = code; }, end(text) { result = JSON.parse(text); } });
+      await route.handler(req, { writeHead(code) { status = code; }, end(text) { result = JSON.parse(text); } }, peer ?? undefined);
       return { ...result, status };
     },
     get(refresh = false) { return this.request(`/usage-lite/quotas${refresh ? "?refresh=1" : ""}`); },
