@@ -223,15 +223,16 @@ window.__ModuleLoader__.load({
 		function humanizeReset(seconds, resetAt) {
 			let s = resetAt != null ? Math.round((resetAt - Date.now()) / 1000) : seconds;
 			if (s == null || !(s > 0)) return null;
-			if (s >= 86400) {
-				if (resetAt == null) return `${(s / 86400).toFixed(s >= 10 * 86400 ? 0 : 1)} 天后重置`;
-				const d = new Date(resetAt);
-				const p2 = (n) => String(n).padStart(2, "0");
-				const hhmm = `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
-				return d.getFullYear() === new Date().getFullYear() ? `${hhmm} 重置` : `${d.getFullYear()}-${hhmm} 重置`;
-			}
-			if (s >= 3600) return `${(s / 3600).toFixed(s >= 10 * 3600 ? 0 : 1)} 小时后重置`;
-			return `${Math.max(1, Math.round(s / 60))} 分钟后重置`;
+			let rel;
+			if (s >= 86400) rel = `${(s / 86400).toFixed(s >= 10 * 86400 ? 0 : 1)} 天后重置`;
+			else if (s >= 3600) rel = `${(s / 3600).toFixed(s >= 10 * 3600 ? 0 : 1)} 小时后重置`;
+			else rel = `${Math.max(1, Math.round(s / 60))} 分钟后重置`;
+			if (resetAt == null) return rel;
+			const d = new Date(resetAt);
+			const p2 = (n) => String(n).padStart(2, "0");
+			const hhmm = `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+			const abs = d.getFullYear() === new Date().getFullYear() ? hhmm : `${d.getFullYear()}-${hhmm}`;
+			return `${rel} · ${abs}`;
 		}
 
 		function QuotaWindow({ w }) {
